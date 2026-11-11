@@ -1,0 +1,68 @@
+# News Credibility and Claim Verification System
+# Target: Python 3.10-3.12 (use 3.11 locally to match Colab/Kaggle).
+# Python 3.13+ is NOT supported by these pins (torch/spaCy/SHAP wheels).
+#
+# Grouped by pipeline stage (phase numbers as in the README).
+
+# Data handling
+numpy
+pandas
+pyarrow
+
+# Text NLP
+spacy
+langdetect
+python-dateutil
+
+# Phase 2: preprocessing, topic clustering, EDA
+scikit-learn
+matplotlib
+jupyter
+
+# Testing
+pytest
+
+# Transformers + embeddings (torch is the backend both need)
+torch
+transformers
+sentence-transformers
+
+# Phase 3A/3B: claim extraction training + hybrid retrieval
+# (spaCy model: python -m spacy download en_core_web_sm)
+datasets
+sentencepiece
+protobuf
+accelerate
+faiss-cpu
+rank-bm25
+
+# Phase 3D/3E: media (CLIP, perceptual hashing, images). Video dropped: future work
+open_clip_torch
+imagehash
+Pillow
+joblib
+
+# Phase 3F/3G: source + social credibility
+networkx
+tldextract
+
+# Meta-learner
+lightgbm
+
+# Explainability
+shap
+
+# Backend
+fastapi
+uvicorn
+python-multipart  # FastAPI form/file uploads
+httpx  # FastAPI TestClient
+
+# Phase 5: LLM explanations via OpenAI-compatible router (freellmapi)
+openai
+
+# Phase 6/7: history + feedback database, Streamlit frontend
+sqlalchemy
+streamlit
+plotly
+requests

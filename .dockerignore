@@ -1,0 +1,18 @@
+# Keep the build context small and secret-free: models and data are mounted at run time.
+data/
+models/
+*.parquet
+.env
+.env.*
+venv/
+.venv/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+notebooks/
+reports/
+*.db
+*.sqlite
+.vscode/
+.idea/

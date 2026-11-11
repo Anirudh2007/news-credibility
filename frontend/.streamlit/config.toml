@@ -1,0 +1,63 @@
+# Streamlit reads this file from the folder `streamlit run` is started in: run the app from frontend/.
+
+[client]
+toolbarMode = "minimal"          # no "Deploy" / developer menu for visitors
+showSidebarNavigation = false
+
+[browser]
+gatherUsageStats = false
+
+[server]
+headless = true
+
+[theme]
+base = "light"
+font = "'Public Sans':https://fonts.googleapis.com/css2?family=Public+Sans:wght@400..700&display=swap, sans-serif"
+headingFont = "'Libre Baskerville':https://fonts.googleapis.com/css2?family=Libre+Baskerville:wght@400;700&display=swap, serif"
+baseRadius = "0.75rem"
+buttonRadius = "0.6rem"
+showSidebarBorder = false
+
+[theme.light]
+primaryColor = "#1F5FA6"
+backgroundColor = "#F6F3EC"
+secondaryBackgroundColor = "#EDE8DD"
+textColor = "#1D2633"
+linkColor = "#1F5FA6"
+borderColor = "#DED6C6"
+dataframeHeaderBackgroundColor = "#EDE8DD"
+redColor = "#B23E0A"
+orangeColor = "#B97F06"
+blueColor = "#1F5FA6"
+greenColor = "#2F7D5B"
+grayColor = "#6B7280"
+chartCategoricalColors = ["#1F5FA6", "#C4480E", "#B97F06", "#5B8FC9", "#6B7280"]
+
+[theme.light.sidebar]
+backgroundColor = "#16202E"
+secondaryBackgroundColor = "#22304A"
+textColor = "#E9E5DC"
+primaryColor = "#F08A4B"
+borderColor = "#2E3C55"
+
+[theme.dark]
+primaryColor = "#8FB8E8"
+backgroundColor = "#111823"
+secondaryBackgroundColor = "#1B2533"
+textColor = "#ECE8DF"
+linkColor = "#8FB8E8"
+borderColor = "#2A3545"
+dataframeHeaderBackgroundColor = "#1B2533"
+redColor = "#F08A4B"
+orangeColor = "#E9B44C"
+blueColor = "#8FB8E8"
+greenColor = "#7FCBA4"
+grayColor = "#8E99A8"
+chartCategoricalColors = ["#8FB8E8", "#F08A4B", "#E9B44C", "#5B8FC9", "#8E99A8"]
+
+[theme.dark.sidebar]
+backgroundColor = "#0B1119"
+secondaryBackgroundColor = "#18212E"
+textColor = "#E9E5DC"
+primaryColor = "#F08A4B"
+borderColor = "#243042"

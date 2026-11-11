@@ -1,0 +1,32 @@
+# Azure VM additions on top of docker-compose.yml: HTTPS in front of the UI (Caddy gets a Let's Encrypt
+# certificate for the VM's DNS name), and every service restarts after a VM reboot.
+#
+#   SITE_ADDRESS=<dns-name>.<region>.cloudapp.azure.com \
+#     docker compose -f docker-compose.yml -f configs/azure/docker-compose.azure.yml up -d --build
+#
+# Only ports 22, 80 and 443 are open in the VM's network security group; 8000/8501 stay private.
+services:
+  api:
+    restart: unless-stopped
+    environment:
+      EXPLAIN_ENABLED: "0"   # no LLM router on the VM: template explanations, no 3 s connection attempts
+  frontend:
+    restart: unless-stopped
+  caddy:
+    image: caddy:2.10
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:?set SITE_ADDRESS to the VM's DNS name}
+    volumes:
+      - ./configs/azure/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - frontend
+
+volumes:
+  caddy-data:
+  caddy-config:

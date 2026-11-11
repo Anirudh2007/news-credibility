@@ -1,0 +1,42 @@
+# --- Data, models, secrets: never commit ---
+data/
+models/
+*.parquet
+.env
+.env.*
+!.env.example
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- Experiment tracking / caches ---
+mlruns/
+wandb/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.log
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# --- Local tool settings ---
+.cursor/
+.aider*
+.playwright-mcp/

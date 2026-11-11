@@ -1,0 +1,11 @@
+#cloud-config
+# First boot of the Azure VM (Ubuntu 24.04): Docker + Compose, and the admin user may run docker.
+package_update: true
+packages:
+  - docker.io
+  - docker-compose-v2
+runcmd:
+  - systemctl enable --now docker
+  - usermod -aG docker azureuser
+  - mkdir -p /home/azureuser/news-credibility
+  - chown azureuser:azureuser /home/azureuser/news-credibility
