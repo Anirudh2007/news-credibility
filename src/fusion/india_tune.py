@@ -1642,18 +1642,204 @@ RCA2_KEEP_RIGHT_REASON = 0.90
 RCA2_SAME_WORDING = OWN_CLAIM  # cosine at or above which a checked claim is our claim in almost the same words
 # --- END OF WHAT WAS FIXED BEFORE MEASURING ---------------------------------------------------------------
 
+RCA2_LISTS = "rca2_lists"  # recordings of the three lists (as written), beside the round-1 recordings
+RCA2_REWORDED = "rca2_reworded"
+RCA2_LABELS = ROOT / "reports" / "root_cause_a_labels.csv"
+RCA2_LOST = ROOT / "reports" / "root_cause_a_lost_fakes.csv"
+RCA2_REPORT = ROOT / "reports" / "root_cause_a_round2.json"
+RCA2_REUSED = {"M02": "FB-03", "M05": "FB-09", **{k: k for k in RCA_CASES}}  # recorded in round 1 (cases.pkl)
+RCA2_ORDER = ("M01", "M03", "M04", "T06", "D01", "D02")  # recorded first: the named inputs
+
+
+def rca2_list_texts() -> dict[str, tuple[str, str, float | None]]:
+    """list id -> (kind, text, label): myths are fake (0), facts true (1), demo inputs unlabelled."""
+    out = {k: ("myth", t, 0.0) for k, t in RCA2_MYTHS.items()}
+    out.update({k: ("fact", v["text"], 1.0) for k, v in RCA2_TRUE_FACTS.items()})
+    out.update({k: ("demo", v["text"], None) for k, v in RCA2_DEMO.items()})
+    return out
+
+
+def record_lists() -> Path:
+    """The three fixed lists through the pipeline as the app runs it (live lookups on, no dates), recorded like
+    `record_cases`. Inputs recorded in round 1 are reused. Resumable: an input already recorded is not run again.
+    Stops before the live-search allowance RCA2_MAX_LIVE_SEARCHES is passed and says what is missing."""
+    from src.pipeline import NewsItem, Pipeline
+    from src.verify.model import ClaimMatcher, claim_behind, reliability_of
+
+    texts = rca2_list_texts()
+    cases = _load("cases")
+    path = CACHE / f"{RCA2_LISTS}.pkl"
+    done = _load(RCA2_LISTS) if path.exists() else {"ids": [], "items": [], "live_searches": {"factcheck": 0, "news": 0}}
+    have = dict(zip(done["ids"], done["items"]))
+    for lid, cid in RCA2_REUSED.items():
+        it = cases["items"][cases["ids"].index(cid)]
+        assert texts[lid][1].strip() and len(it["calls"]) >= 1, lid
+        have.setdefault(lid, it)
+    order = list(RCA2_ORDER) + [k for k in texts if k not in RCA2_ORDER]
+    todo = [k for k in order if k not in have]
+    spent = dict(done["live_searches"])
+    if todo:
+        cosine = ClaimMatcher(model=None)
+        pipe = Pipeline()
+        verifier = pipe.get("verifier")
+        calls: list[dict] = []
+        original_verify = verifier.verify
+
+        def recording_verify(claim, hits, **kw):
+            v = original_verify(claim, hits, **kw)
+            probs = verifier.predict(claim, [h.passage.text for h in hits]) if hits else np.zeros((0, 4))
+            calls.append({"claim": claim, "hits": list(hits), "probs": probs,
+                          "matches": cosine.similarity(claim, [claim_behind(h.passage) for h in hits]),
+                          "rel": [reliability_of(h.passage.domain, verifier.reliability) for h in hits]})
+            return v
+
+        verifier.verify = recording_verify
+        clients = {n: pipe.get(n) for n in ("factcheck", "news")}
+        start = {n: (c.calls if c is not None else 0) for n, c in clients.items()}
+        for lid in todo:
+            now = {n: spent[n] + (c.calls - start[n] if c is not None else 0) for n, c in clients.items()}
+            if sum(now.values()) + 4 > RCA2_MAX_LIVE_SEARCHES:  # one input costs at most 2 + 2 searches
+                print(f"stopped before {lid}: {sum(now.values())} live searches used", flush=True)
+                break
+            calls.clear()
+            rep = pipe.analyze(NewsItem(text=texts[lid][1]))
+            have[lid] = {"features": rep["features"], "abstained": rep["abstained"], "score": rep["score"],
+                         "claims": [{"text": c["text"], "checkworthiness": c["checkworthiness"],
+                                     "context": c.get("context")} for c in rep["claims"]],
+                         "calls": list(calls), "date": None}
+            print(f"{lid}: {rep['score']} {rep['band']} {[c.get('verdict') for c in rep['claims']]}", flush=True)
+        spent = {n: spent[n] + (c.calls - start[n] if c is not None else 0) for n, c in clients.items()}
+    ids = [k for k in order if k in have]
+    with open(path, "wb") as f:
+        pickle.dump({"ids": ids, "items": [have[k] for k in ids], "kinds": [texts[k][0] for k in ids],
+                     "labels": [texts[k][2] for k in ids], "live_searches": spent}, f)
+    print(f"recorded {len(ids)}/{len(texts)} list inputs; missing {[k for k in order if k not in have]}; live "
+          f"searches used for the lists so far: {spent} | saved {path}")
+    return path
+
+
+def reword_lists() -> Path:
+    """The true facts of list 2 in their three rewordings, on the evidence recorded for the fact as written (the
+    verifier and the cosine matcher are re-run on the new wording; no search is repeated). The five known cases
+    reuse round 1's rewordings and recordings."""
+    from src.verify.model import ClaimMatcher, ClaimVerifier, claim_behind
+
+    lists, old = _load(RCA2_LISTS), _load("cases_reworded")
+    verifier, matcher = ClaimVerifier(matcher=None, match_min=-1.0), ClaimMatcher(model=None)
+    ids, items, skipped = [], [], []
+    for fid, fact in RCA2_TRUE_FACTS.items():
+        if fid in RCA_CASES:
+            for k in (1, 2, 3):
+                ids.append(f"{fid}#{k}")
+                items.append(old["items"][old["ids"].index(f"{fid}#{k}")])
+            continue
+        if fid not in lists["ids"]:
+            skipped.append(fid)
+            continue
+        it = lists["items"][lists["ids"].index(fid)]
+        if len(it["calls"]) != 1 or len(it["claims"]) != 1:  # not one checkable claim: nothing to replay
+            skipped.append(fid)
+            continue
+        c = it["calls"][0]
+        for k, text in enumerate(fact["rewordings"], 1):
+            call = {**c, "claim": text, "probs": verifier.predict(text, [h.passage.text for h in c["hits"]]),
+                    "matches": matcher.similarity(text, [claim_behind(h.passage) for h in c["hits"]])}
+            ids.append(f"{fid}#{k}")
+            items.append({**it, "claims": [{**it["claims"][0], "text": text}], "calls": [call]})
+    path = CACHE / f"{RCA2_REWORDED}.pkl"
+    with open(path, "wb") as f:
+        pickle.dump({"ids": ids, "items": items, "kinds": ["fact"] * len(ids), "labels": [1.0] * len(ids)}, f)
+    print(f"{len(ids)} rewordings saved; facts without a single recorded claim (not reworded): {skipped} | {path}")
+    return path
+
+
+def _pair_id(ours: str, checked: str) -> str:
+    import hashlib
+
+    return hashlib.sha1(f"{ours}\x1f{checked}".encode("utf-8")).hexdigest()[:10]
+
+
+def _passage_info(e) -> dict:
+    """What a verdict passage checked, how it was rated and by whom (AVeriTeC answers carry no rating)."""
+    from src.retrieval.factcheck_api import parse_factcheck_passage
+    from src.verify.model import claim_behind
+
+    info = parse_factcheck_passage(e.text)
+    if info:
+        return {"checked_claim": info["claim"], "rating": info["rating"], "outlet": info["who"]}
+    return {"checked_claim": claim_behind(SimpleNamespace(text=e.text, id=e.passage_id)) or "",
+            "rating": "(AVeriTeC answer, no rating)", "outlet": e.domain or "AVeriTeC"}
+
+
+def acting_against(call: dict, verdict) -> list[dict]:
+    """The verdict passages that count in a claim's vote and are read as refuting it (P(Refuted) >= RCA_REFUTING)."""
+    out = []
+    for e in verdict.evidence:
+        if e.counted and not math.isnan(e.claim_match) and e.probs["Refuted"] >= RCA_REFUTING:
+            info = _passage_info(e)
+            out.append({"pair_id": _pair_id(call["claim"], info["checked_claim"]), "our_claim": call["claim"], **info,
+                        "cosine": float(e.claim_match), "weight": float(e.weight), "p_refuted": float(e.probs["Refuted"])})
+    return out
+
+
+RCA2_TODAY = {"family": "today", "match_min": RCA_BEFORE_MATCH_MIN, "entail_mode": "off", "entail_min": 0.0}
+
+
+def label_sheet(out: str) -> None:
+    """Every passage that counts against a dev fake rated Low by today's system, for labelling by hand. No value of
+    any candidate is written (no entailment value, no outcome), so the labels are made blind to them. Passages
+    whose checked claim has almost our wording are labelled automatically."""
+    import csv
+
+    dev = _rca_rec("dev")
+    y = np.array(dev["labels"], dtype=float)
+    texts = load_set("dev")["text"].tolist()
+    scores, verdicts = _rca_replay(dev, RCA2_TODAY, models()["deployed"])
+    rows, n_low, n_auto = [], 0, 0
+    for i, (it, s, vs) in enumerate(zip(dev["items"], scores, verdicts)):
+        if y[i] != 0.0 or math.isnan(s) or s > 30:
+            continue
+        n_low += 1
+        against = [a for c, v in zip(it["calls"], vs) for a in acting_against(c, v)]
+        auto = any(a["cosine"] >= RCA2_SAME_WORDING for a in against)
+        n_auto += auto
+        for a in against:
+            rows.append({"item": i, "pair_id": a["pair_id"], "item_text": texts[i], "our_claim": a["our_claim"],
+                         "checked_claim": a["checked_claim"], "rating": a["rating"], "outlet": a["outlet"],
+                         "label": "same claim" if a["cosine"] >= RCA2_SAME_WORDING else "",
+                         "item_has_same_wording_passage": int(auto)})
+    with open(out, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    todo = len({r["pair_id"] for r in rows if not r["label"]})
+    print(f"dev fakes rated Low today: {n_low}; with a same-wording passage: {n_auto}; passages acting against "
+          f"them: {len(rows)}; distinct pairs to label by hand: {todo} | {out}")
+
 
 def _load(name: str) -> dict:
     with open(CACHE / f"{name}.pkl", "rb") as f:
         return pickle.load(f)
 
 
+RCA2_STAGES = {
+    "lists": lambda a: record_lists(),          # record the three fixed lists (live lookups, allowance-guarded)
+    "reword": lambda a: reword_lists(),         # the facts in three rewordings each, on the recorded evidence
+    "sheet": lambda a: label_sheet(a.out),      # passages acting against today's Low dev fakes, for hand labels
+}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("record", "choose", "report", "augment", "absence", "absence-recheck", "absence-hoax", "time-rule",
-                 "root-cause-a"):
+                 "root-cause-a", "root-cause-a2"):
         p = sub.add_parser(name)
+        if name == "root-cause-a2":
+            p.add_argument("--stage", choices=sorted(RCA2_STAGES), required=True, help="round 2: see RCA2_STAGES")
+            p.add_argument("--out", default=None, help="file to write (stages that export a sheet)")
+            p.add_argument("--labels", default=None, help="file with hand labels: pair_id,label per line")
+            p.add_argument("--nli", default=None, help="NLI model name (stages that compute entailment values)")
         if name == "root-cause-a":
             p.add_argument("--stage", choices=["cases", "entail", "dev", "served", "test"], required=True,
                            help="cases: record the known cases (live lookups); entail: entailment values for the "
@@ -1690,6 +1876,8 @@ def main() -> None:
     elif args.cmd == "root-cause-a":
         {"cases": record_cases, "entail": entail_stage, "dev": root_cause_a_dev,
          "served": lambda: record_cases(save=False), "test": root_cause_a_test}[args.stage]()
+    elif args.cmd == "root-cause-a2":
+        RCA2_STAGES[args.stage](args)
     elif args.cmd == "choose":
         dev = _load(f"dev{suffix}")
         matcher, oof = fit_matcher(dev)
