@@ -6,6 +6,12 @@ models/
 .env.*
 !.env.example
 
+# --- Generated output, kept locally: evaluation results, figures, notebooks ---
+# (the empty reports/ folder stays so the evaluation scripts have somewhere to write)
+reports/*
+!reports/.gitkeep
+notebooks/
+
 # --- Python ---
 __pycache__/
 *.py[cod]
@@ -35,8 +41,3 @@ Thumbs.db
 desktop.ini
 .vscode/
 .idea/
-
-# --- Local tool settings ---
-.cursor/
-.aider*
-.playwright-mcp/

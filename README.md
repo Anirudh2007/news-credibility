@@ -23,7 +23,7 @@ India test sets done; deployment and the final report remain.
 | 5 | Explanations (SHAP points, templates, optional LLM wording) | `src/explain/` |
 | 6 | FastAPI backend, SQLite history and feedback | `api/` |
 | 7 | Streamlit frontend | `frontend/` |
-| 8 | Evaluation, robustness, Docker | `src/fusion/evaluate.py`, `reports/` |
+| 8 | Evaluation, robustness, Docker | `src/fusion/evaluate.py`, `Dockerfile` |
 
 ## Setup
 
@@ -94,7 +94,7 @@ India sets plus 60 invented-event hoaxes, decision rule written first):** silenc
 0.42 on test, both 95% intervals below 1). The search also misses about 1 in 10 real big events, so the rule has a
 price: in the deployed setting true claims rated Low would rise 4.4% → 5.7% on dev (target ≤ 5%) and 8.7% → 12.0%
 on test (target < 10%), for invented-event hoaxes rated Low 47% → 70% (test). Both targets fail, so the rule is
-**off**: the report shows "No trusted outlet reported this" without scoring it (`reports/absence_hoax_eval.json`).
+**off**: the report shows "No trusted outlet reported this" without scoring it (`python -m src.fusion.india_tune absence-hoax`).
 `NEWSCRED_ABSENCE_LR=0.27` switches it on for a demonstration. An earlier measurement (6 Nov, LR 1.26) had three flaws, explained in
 `src/retrieval/coverage.py`.
 
@@ -166,7 +166,7 @@ python -m src.fusion.evaluate real-fake         # well-known true/false claims +
 python -m src.fusion.evaluate evidence-box      # evidence box: shown how often, right how often -> evidence_box_metrics.json
 ```
 
-India-context data (test sets + Indian fact-checks as evidence; `DATASETS.md` §7, `reports/india_eval.md`):
+India-context data (test sets + Indian fact-checks as evidence; `DATASETS.md` §7):
 
 ```bash
 python -m src.ingest.load_india                 # download + clean IFND, FakeCovid India, MultiClaim
@@ -182,7 +182,7 @@ To run the app with the Indian evidence index: `$env:NEWSCRED_RETRIEVAL_DIR="mod
 (PowerShell; `set NEWSCRED_RETRIEVAL_DIR=...` in cmd) before starting the API. Default: `models/retrieval_index`.
 
 Input that is not readable English (keyboard mashing, symbols, other languages) is refused with a reason
-(`src/ingest/guard.py`); input with nothing checkable gets no score ("Unverified"). See `reports/robustness.md`.
+(`src/ingest/guard.py`); input with nothing checkable gets no score ("Unverified"). Measured with `python -m src.fusion.evaluate robustness`.
 
 ## Docker
 
@@ -229,11 +229,11 @@ too small for the models).
 | Path | Purpose |
 | --- | --- |
 | `data/` | raw, interim, processed datasets and reference files (not in git) |
-| `notebooks/` | EDA and experiments, numbered `01_`, `02_` ... |
+| `notebooks/` | EDA and experiments (not in git) |
 | `src/` | pipeline code, one folder per stage |
 | `models/` | saved checkpoints (not in git) |
 | `api/` | FastAPI backend |
 | `frontend/` | Streamlit demo |
 | `tests/` | pytest tests |
-| `configs/` | reserved for config files; settings are environment variables today (`.env.example`) |
-| `reports/` | figures, evaluation results, final report |
+| `configs/azure/` | Azure VM scripts: create the VM, deploy, HTTPS (settings are environment variables, `.env.example`) |
+| `reports/` | output of the evaluation scripts: JSON results and figures (not in git) |
