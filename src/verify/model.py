@@ -379,6 +379,7 @@ class ClaimMatcher:
 #     "off"          cosine matching only (the behaviour up to 0.10.1)
 #     "both"         the passage counts only if each claim entails the other (the same claim)
 #     "directional"  a passage read as speaking against our claim needs A => B, one speaking for it needs B => A
+#     "same"         round 2: the two claims say the same thing (`same_claim_allows`, below)
 # Measured on the India dev set by the rule in src/fusion/india_tune.py (ROOT_CAUSE_A_DECISION), 2026-11-12:
 # NOT shipped, the mode stays "off". "directional" at 0.5 fixed all five known cases in every rewording and left
 # 3 of 227 true dev claims with a counted refuting fact-check (20 before), but fakes rated Low fell from 68.7% to
@@ -389,6 +390,20 @@ ENTAIL_MODEL = "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli"  # MIT licence; De
 ENTAIL_MODE = os.environ.get("NEWSCRED_ENTAIL_MODE", "off")
 ENTAIL_MIN = float(os.environ.get("NEWSCRED_ENTAIL_MIN", "0.5"))
 ENTAIL_MAX_LENGTH = 256  # two claims, each a sentence or two
+# Round 2 (2026-11-12), mode "same": do the two claims say the same thing? Round 1's direction test lost real
+# catches (a fact-checker words a rumour more fully than a user: "Video shows PM Modi using curse words at a
+# rally in Gujarat" implies "Modi used curse words at a rally in Gujarat", not the other way round) and let
+# through generic captions and expired verdicts ("Pope Francis had passed away", rated False before he died,
+# is implied by "Pope Francis died in April 2025"). A verdict passage counts if
+#     each claim implies the other; or
+#     the checked claim implies ours and the wording is close (cosine >= SAME_CONTAINS_COS); or
+#     ours implies the checked claim and the wording is very close (cosine >= SAME_FORWARD_COS);
+# and a fact-check that CONFIRMED its claim counts against ours only if the two claims contradict each other
+# ("Vaccines do not cause autism", rated True, against "Vaccines cause autism"). A passage that passes the
+# similarity threshold but not this test is a fact-check of a RELATED claim: it does not count, and it is marked
+# so that it can be shown as context. Measured in src/fusion/india_tune.py (ROOT_CAUSE_A_SCORECARD).
+SAME_CONTAINS_COS = float(os.environ.get("NEWSCRED_SAME_CONTAINS_COS", "0.70"))
+SAME_FORWARD_COS = float(os.environ.get("NEWSCRED_SAME_FORWARD_COS", "0.90"))
 
 
 class ClaimEntailment:
@@ -403,7 +418,9 @@ class ClaimEntailment:
         self.batch_size = batch_size
         self._tok = self._model = None
         self._entail_id = 0
+        self._contra_id: int | None = None
         self._memo: dict[tuple[str, str], float] = {}
+        self._memo3: dict[tuple[str, str], tuple[float, float]] = {}
 
     def _load(self):
         import torch
@@ -416,21 +433,29 @@ class ClaimEntailment:
         if len(ids) != 1:
             raise ValueError(f"{self.model_name}: no single entailment label in {self._model.config.id2label}")
         self._entail_id = int(ids[0])
+        contra = [i for i, name in self._model.config.id2label.items() if str(name).lower().startswith("contra")]
+        self._contra_id = int(contra[0]) if len(contra) == 1 else None  # two-class models have no such label
 
-    def _infer(self, pairs: Sequence[tuple[str, str]]) -> list[float]:
+    def _infer2(self, pairs: Sequence[tuple[str, str]]) -> list[tuple[float, float]]:
+        """(P(entailment), P(contradiction)) per pair; contradiction is 0 for a model without that label."""
         import torch
 
         if self._model is None:
             self._load()
-        out: list[float] = []
+        out: list[tuple[float, float]] = []
         for i in range(0, len(pairs), self.batch_size):
             batch = list(pairs[i : i + self.batch_size])
             enc = self._tok([a for a, _ in batch], [b for _, b in batch], truncation=True, max_length=ENTAIL_MAX_LENGTH,
                             padding=True, return_tensors="pt").to(self.device)
             with torch.inference_mode():
-                probs = torch.softmax(self._model(**enc).logits.float(), dim=-1)[:, self._entail_id]
-            out += probs.cpu().tolist()
+                probs = torch.softmax(self._model(**enc).logits.float(), dim=-1).cpu()
+            ent = probs[:, self._entail_id].tolist()
+            con = probs[:, self._contra_id].tolist() if self._contra_id is not None else [0.0] * len(batch)
+            out += list(zip(ent, con))
         return out
+
+    def _infer(self, pairs: Sequence[tuple[str, str]]) -> list[float]:
+        return [e for e, _ in self._infer2(pairs)]
 
     def entails(self, pairs: Sequence[tuple[str, str]]) -> np.ndarray:
         pairs = [(a, b) for a, b in pairs]
@@ -439,6 +464,18 @@ class ClaimEntailment:
             vals = self._predict_fn(miss) if self._predict_fn is not None else self._infer(miss)
             self._memo.update(zip(miss, map(float, vals)))
         return np.array([self._memo[p] for p in pairs], dtype=float)
+
+    def relations(self, pairs: Sequence[tuple[str, str]]) -> np.ndarray:
+        """(n, 2): P(premise entails hypothesis), P(premise contradicts hypothesis). `predict_fn` (tests) may
+        return one number per pair (entailment only: contradiction 0) or two."""
+        pairs = [(a, b) for a, b in pairs]
+        miss = [p for p in dict.fromkeys(pairs) if p not in self._memo3]
+        if miss:
+            vals = self._predict_fn(miss) if self._predict_fn is not None else self._infer2(miss)
+            for p, v in zip(miss, vals):
+                e, c = (float(v), 0.0) if np.ndim(v) == 0 else (float(v[0]), float(v[1]))
+                self._memo3[p] = (e, c)
+        return np.array([self._memo3[p] for p in pairs], dtype=float).reshape(-1, 2)
 
     def both_ways(self, claim: str, others: Sequence[str | None]) -> np.ndarray:
         """(n, 2): column 0 = P(claim entails other), column 1 = P(other entails claim); NaN where other is None."""
@@ -449,8 +486,19 @@ class ClaimEntailment:
             out[idx, 0], out[idx, 1] = vals[: len(idx)], vals[len(idx):]
         return out
 
+    def four_ways(self, claim: str, others: Sequence[str | None]) -> np.ndarray:
+        """(n, 4): P(claim entails other), P(claim contradicts other), P(other entails claim), P(other contradicts
+        claim); NaN rows where other is None."""
+        out = np.full((len(others), 4), np.nan)
+        idx = [i for i, o in enumerate(others) if o]
+        if idx:
+            vals = self.relations([(claim, others[i]) for i in idx] + [(others[i], claim) for i in idx])
+            out[idx, 0:2], out[idx, 2:4] = vals[: len(idx)], vals[len(idx):]
+        return out
+
     def clear_memo(self) -> None:
         self._memo.clear()
+        self._memo3.clear()
 
 
 def entailment_allows(probs: np.ndarray, entail_row: Sequence[float], mode: str, entail_min: float) -> bool:
@@ -464,6 +512,34 @@ def entailment_allows(probs: np.ndarray, entail_row: Sequence[float], mode: str,
     return (fwd if against else bwd) >= entail_min
 
 
+def same_claim_allows(probs: np.ndarray, relations: Sequence[float], cosine: float, answer: str | None,
+                      entail_min: float = ENTAIL_MIN, contains_cos: float | None = None,
+                      forward_cos: float | None = None) -> bool:
+    """Mode "same": may this verdict passage count for our claim? probs: the verifier's reading of the passage
+    against our claim; relations: [P(ours entails checked), P(ours contradicts checked), P(checked entails ours),
+    P(checked contradicts ours)]; cosine: similarity of the two claims; answer: the fact-check's answer to its own
+    claim ("Yes" / "No" / "Partly"; None for a passage that is not a rated fact-check)."""
+    contains_cos = SAME_CONTAINS_COS if contains_cos is None else contains_cos
+    forward_cos = SAME_FORWARD_COS if forward_cos is None else forward_cos
+    ef, cf, eb, cb = (float(x) for x in relations)
+    score, _ = credibility_from_probs(np.asarray(probs, dtype=float))
+    if answer == "Yes" and score < 0.5:  # a confirmed claim, read as speaking against ours: they must contradict
+        return min(cf, cb) >= entail_min
+    if min(ef, eb) >= entail_min:  # each claim says what the other says
+        return True
+    if eb >= entail_min and cosine >= contains_cos:  # the checked claim says everything ours says
+        return True
+    return bool(ef >= entail_min and cosine >= forward_cos)  # ours says everything the checked claim says
+
+
+def fact_check_answer(text: str | None) -> str | None:
+    """A fact-check passage's answer to its own claim ("Yes" / "No" / "Partly"), else None."""
+    from src.retrieval.factcheck_api import parse_factcheck_passage
+
+    info = parse_factcheck_passage(text or "")
+    return info["answer"] if info else None
+
+
 @dataclass
 class EvidenceUse:
     passage_id: str
@@ -475,6 +551,7 @@ class EvidenceUse:
     date: str | None = None  # passage date (ISO), shown with quoted evidence
     claim_match: float = math.nan  # similarity of the claim this passage judged to ours (NaN: not a verdict)
     counted: bool = True  # False: a verdict on a different claim, read as NEE
+    related: bool = False  # True: similar enough to pass the threshold, but not the same claim (mode "same")
 
 
 @dataclass
@@ -595,6 +672,8 @@ class ClaimVerifier:
         others = [claim_behind(h.passage) for h in hits]
         if matches is not None:
             others = [o if not (m < self.match_min) else None for o, m in zip(others, matches)]
+        if self.entail_mode == "same":
+            return self.entailer.four_ways(claim, others)
         return self.entailer.both_ways(claim, others)
 
     def verify(self, claim: str, hits: Sequence, no_support: set[str] | frozenset = frozenset()) -> Verdict:
@@ -653,7 +732,8 @@ def verdict_from(hits: Sequence, passage_probs: np.ndarray, matches: Sequence[fl
     re-ranker score among the passages that count. Kept separate from ClaimVerifier so threshold
     tuning reuses exactly this code.
     entail (n, 2) with entail_mode "both" / "directional": a verdict passage that passed the similarity
-    threshold must also pass `entailment_allows` (NaN rows, i.e. passages that are not verdicts, are not tested)."""
+    threshold must also pass `entailment_allows` (NaN rows, i.e. passages that are not verdicts, are not tested).
+    entail (n, 4) with entail_mode "same": it must pass `same_claim_allows`; one that does not is marked related."""
     passage_probs = np.array(passage_probs, dtype=float).reshape(-1, len(LABELS))
     matches = np.asarray(matches, dtype=float)
     counted = ~(matches < match_min)  # NaN (not a verdict) counts
@@ -663,7 +743,15 @@ def verdict_from(hits: Sequence, passage_probs: np.ndarray, matches: Sequence[fl
         if str(h.passage.id) in no_support:
             p = passage_probs[i]
             passage_probs[i] = [0.0, p[R], p[NEE] + p[S], p[C]]
-    if entail is not None and entail_mode != "off":
+    related = np.zeros(len(hits), dtype=bool)
+    if entail is not None and entail_mode == "same":
+        entail = np.asarray(entail, dtype=float).reshape(-1, 4)
+        for i in np.flatnonzero(counted & ~np.isnan(matches)):
+            if not np.isnan(entail[i]).any() and not same_claim_allows(
+                    passage_probs[i], entail[i], matches[i], fact_check_answer(hits[i].passage.text), entail_min):
+                counted[i] = False
+                related[i] = True
+    elif entail is not None and entail_mode != "off":
         entail = np.asarray(entail, dtype=float).reshape(-1, 2)
         for i in np.flatnonzero(counted & ~np.isnan(matches)):
             if not np.isnan(entail[i]).any() and not entailment_allows(passage_probs[i], entail[i], entail_mode, entail_min):
@@ -687,8 +775,9 @@ def verdict_from(hits: Sequence, passage_probs: np.ndarray, matches: Sequence[fl
         score, conf = math.nan, 0.0
     evidence = [
         EvidenceUse(h.passage.id, h.passage.text, h.passage.source_url, h.passage.domain, float(wi),
-                    dict(zip(LABELS, pp.tolist())), h.passage.date, float(m), bool(c))
-        for h, wi, pp, m, c in sorted(zip(hits, w, passage_probs, matches, counted), key=lambda t: (not t[4], -t[1]))
+                    dict(zip(LABELS, pp.tolist())), h.passage.date, float(m), bool(c), bool(r))
+        for h, wi, pp, m, c, r in sorted(zip(hits, w, passage_probs, matches, counted, related),
+                                         key=lambda t: (not t[4], -t[1]))
     ]
     scores = [h.score for h, c in zip(hits, counted) if c]
     relevance = 1.0 / (1.0 + math.exp(-max(scores))) if scores else math.nan

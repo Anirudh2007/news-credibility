@@ -39,6 +39,7 @@ import math
 import pickle
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
@@ -271,7 +272,8 @@ def replay_rows(rec: dict, match_min: float, support_only: bool = True,
 
     entail_mode = vm.ENTAIL_MODE if entail_mode is None else entail_mode
     entail_min = vm.ENTAIL_MIN if entail_min is None else entail_min
-    if entail_mode != "off" and any("entail" not in c for it in rec["items"] for c in it["calls"]):
+    key = "nli" if entail_mode == "same" else "entail"  # mode "same" needs both relations in both directions
+    if entail_mode != "off" and any(key not in c for it in rec["items"] for c in it["calls"]):
         raise ValueError("this recording has no entailment values: python -m src.fusion.india_tune root-cause-a --stage entail")
     rows, all_verdicts = [], []
     for it in rec["items"]:
@@ -283,7 +285,7 @@ def replay_rows(rec: dict, match_min: float, support_only: bool = True,
             prefixes = support_prefixes if support_prefixes is not None else (SUPPORT_ONLY_PREFIXES if support_only else ())
             verdicts = [verdict_from(c["hits"], c["probs"], c["matches"], c["rel"], match_min, prefixes,
                                      no_support=no_support_ids(c["claim"], c["hits"], it.get("date")) if time_rule
-                                     else frozenset(), entail=c.get("entail"), entail_mode=entail_mode,
+                                     else frozenset(), entail=c.get(key), entail_mode=entail_mode,
                                      entail_min=entail_min)
                         for c in it["calls"]]
             row.update(F.claim_features(checkable, verdicts))
@@ -1817,6 +1819,788 @@ def label_sheet(out: str) -> None:
           f"them: {len(rows)}; distinct pairs to label by hand: {todo} | {out}")
 
 
+def write_labels(hand_path: str) -> None:
+    """reports/root_cause_a_labels.csv: every passage that counts against a dev fake rated Low today, with its
+    label. `hand_path`: pair_id,label,note lines made by reading the sheet of `label_sheet`. A passage of an item
+    that already has a same-wording passage needs no label (the item is a right-reason catch either way)."""
+    import csv
+
+    hand = {r["pair_id"]: r for r in csv.DictReader(open(hand_path, encoding="utf-8"))}
+    dev = _rca_rec("dev")
+    y = np.array(dev["labels"], dtype=float)
+    scores, verdicts = _rca_replay(dev, RCA2_TODAY, models()["deployed"])
+    rows = {}
+    for i, (it, s, vs) in enumerate(zip(dev["items"], scores, verdicts)):
+        if y[i] != 0.0 or math.isnan(s) or s > 30:
+            continue
+        against = [a for c, v in zip(it["calls"], vs) for a in acting_against(c, v)]
+        auto = any(a["cosine"] >= RCA2_SAME_WORDING for a in against)
+        for a in against:
+            if a["cosine"] >= RCA2_SAME_WORDING:
+                label, how, note = "same claim", "automatic: almost the same wording (cosine >= 0.95)", ""
+            elif a["pair_id"] in hand:
+                label, how, note = hand[a["pair_id"]]["label"], "by hand", hand[a["pair_id"]].get("note", "")
+            elif auto:
+                label, how, note = "", "not labelled: the item has a same-wording passage", ""
+            else:
+                raise SystemExit(f"no label for pair {a['pair_id']} (item {i})")
+            rows[a["pair_id"]] = {"pair_id": a["pair_id"], "set": "dev", "our_claim": a["our_claim"],
+                                  "checked_claim": a["checked_claim"], "rating": a["rating"], "outlet": a["outlet"],
+                                  "label": label, "labelled": how, "note": note}
+    # The famous myths (list 1) as written: every passage that counts against one today, labelled by hand.
+    lists = _rca2_lists_rec()
+    _, verdicts = _rca_replay(lists, RCA2_TODAY, models()["deployed"])
+    for lid, kind, it, vs in zip(lists["ids"], lists["kinds"], lists["items"], verdicts):
+        if kind != "myth":
+            continue
+        for a in (a for c, v in zip(it["calls"], vs) for a in acting_against(c, v)):
+            if a["pair_id"] not in hand:
+                raise SystemExit(f"no label for pair {a['pair_id']} ({lid})")
+            rows.setdefault(a["pair_id"], {
+                "pair_id": a["pair_id"], "set": "myths", "our_claim": a["our_claim"], "checked_claim": a["checked_claim"],
+                "rating": a["rating"], "outlet": a["outlet"], "label": hand[a["pair_id"]]["label"], "labelled": "by hand",
+                "note": hand[a["pair_id"]].get("note", "")})
+    with open(RCA2_LABELS, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(next(iter(rows.values()))))
+        w.writeheader()
+        w.writerows(rows.values())
+    n = {k: sum(r["label"] == k for r in rows.values()) for k in ("same claim", "related claim", "")}
+    print(f"{len(rows)} pairs: {n} | saved {RCA2_LABELS}")
+
+
+def load_labels() -> dict[str, str]:
+    import csv
+
+    with open(RCA2_LABELS, encoding="utf-8") as f:
+        return {r["pair_id"]: r["label"] for r in csv.DictReader(f)}
+
+
+def dump_pairs(out: str, name: str = "dev") -> None:
+    """Diagnostic sheet: every verdict passage of a recording that passes today's similarity threshold and is read
+    as refuting, with the round-1 entailment values and the hand label where one exists."""
+    import csv
+
+    rec = _rca2_recs(RCA_ROUND1_NLI)[0 if name == "dev" else 1]
+    labels = load_labels() if RCA2_LABELS.exists() else {}
+    scores, verdicts = _rca_replay(rec, RCA2_TODAY, models()["deployed"])
+    ids = rec.get("ids") or list(range(len(rec["items"])))
+    rows = []
+    for i, it, lab, s, vs in zip(ids, rec["items"], rec["labels"], scores, verdicts):
+        for c, v in zip(it["calls"], vs):
+            ent = {h.passage.id + "\x1f" + h.passage.text: e for h, e in zip(c["hits"], c["entail"])}
+            nli = {h.passage.id + "\x1f" + h.passage.text: e for h, e in zip(c["hits"], c["nli"])}
+            for e in v.evidence:
+                if math.isnan(e.claim_match) or e.claim_match < RCA_BEFORE_MATCH_MIN:
+                    continue
+                info = _passage_info(e)
+                fwd, bwd = ent[e.passage_id + "\x1f" + e.text]
+                rows.append({"item": i, "true_or_fake": {1.0: "true", 0.0: "fake"}.get(lab, "?"),
+                             "score_today": None if math.isnan(s) else int(s), "our_claim": c["claim"], **info,
+                             "cosine": round(float(e.claim_match), 3), "p_refuted": round(e.probs["Refuted"], 3),
+                             "p_supported": round(e.probs["Supported"], 3), "weight": round(float(e.weight), 3),
+                             "ours_entails_checked": round(float(fwd), 3), "checked_entails_ours": round(float(bwd), 3),
+                             "ours_contradicts_checked": round(float(nli[e.passage_id + "\x1f" + e.text][1]), 3),
+                             "checked_contradicts_ours": round(float(nli[e.passage_id + "\x1f" + e.text][3]), 3),
+                             "label": labels.get(_pair_id(c["claim"], info["checked_claim"]), "")})
+    with open(out, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    print(f"{len(rows)} verdict passages at cosine >= {RCA_BEFORE_MATCH_MIN} | {out}")
+
+
+def _rca2_lists_rec(compute: bool = False) -> dict:
+    """The three lists as written plus the facts' rewordings, with the round-1 entailment values."""
+    a, b = _load(RCA2_LISTS), _load(RCA2_REWORDED)
+    rec = {"ids": a["ids"] + b["ids"], "items": a["items"] + b["items"], "kinds": a["kinds"] + b["kinds"],
+           "labels": a["labels"] + b["labels"]}
+    return with_entail(rec, entail_table([rec], compute=compute))
+
+
+# --- round 2: candidates and their measurement ------------------------------------------------------------
+RCA_ROUND1_NLI = "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli"  # the NLI model of round 1 (MIT licence)
+
+
+def _nli_file(model_name: str) -> Path:
+    import re
+
+    return CACHE / ("nli_pairs_" + re.sub(r"[^A-Za-z0-9]+", "-", model_name).strip("-") + ".pkl")
+
+
+def nli_table(recs: list[dict], model_name: str = RCA_ROUND1_NLI, compute: bool = False) -> dict:
+    """(our claim, checked claim) -> (P(ours entails checked), P(ours contradicts checked), P(checked entails
+    ours), P(checked contradicts ours)) from one NLI model, kept in a file per model so it runs once per pair."""
+    path, table = _nli_file(model_name), {}
+    if path.exists():
+        with open(path, "rb") as f:
+            table = pickle.load(f)
+    miss = [p for p in dict.fromkeys(p for r in recs for p in _verdict_pairs(r)) if p not in table]
+    if miss:
+        if not compute:
+            raise SystemExit(f"NLI values missing for {model_name}: python -m src.fusion.india_tune root-cause-a2 --stage nli")
+        from src.verify.model import ClaimEntailment
+
+        ent = ClaimEntailment(model_name)
+        fwd, bwd = ent.relations(miss), ent.relations([(b, a) for a, b in miss])
+        table.update({p: (float(f[0]), float(f[1]), float(b[0]), float(b[1])) for p, f, b in zip(miss, fwd, bwd)})
+        with open(path, "wb") as f:
+            pickle.dump(table, f)
+    return table
+
+
+def with_nli(rec: dict, table: dict) -> dict:
+    """The recording with, per claim, `nli` (n, 4) aligned with its hits (NaN: not a verdict passage) and `answer`
+    (the fact-check's answer to its own claim: "Yes" / "No" / "Partly"; None for AVeriTeC answers and reports)."""
+    from src.retrieval.factcheck_api import parse_factcheck_passage
+    from src.verify.model import claim_behind
+
+    items = []
+    for it in rec["items"]:
+        calls = []
+        for c in it["calls"]:
+            e = np.full((len(c["hits"]), 4), np.nan)
+            ans = []
+            for k, (h, m) in enumerate(zip(c["hits"], c["matches"])):
+                other = claim_behind(h.passage)
+                info = parse_factcheck_passage(h.passage.text or "")
+                ans.append(info["answer"] if info else None)
+                if other and not np.isnan(m):
+                    e[k] = table[(c["claim"], other)]
+            calls.append({**c, "nli": e, "answer": ans})
+        items.append({**it, "calls": calls})
+    return {**rec, "items": items}
+
+
+def gate_allows(g: dict, cos: float, nli: Sequence[float], answer: str | None, against: bool) -> bool:
+    """May a verdict passage that passed the similarity threshold count for our claim, under candidate gate `g`?
+    nli = (ours entails checked, ours contradicts checked, checked entails ours, checked contradicts ours)."""
+    ef, cf, eb, cb = (float(x) for x in nli)
+    kind, t = g["kind"], g.get("t", 0.5)
+    if kind == "today":
+        return True
+    if kind == "forward":  # round 1: the direction the logic needs
+        return (ef if against else eb) >= t
+    if kind == "both":
+        return min(ef, eb) >= t
+    if kind == "either":
+        return max(ef, eb) >= t
+    if kind == "contains":
+        return eb >= t
+    if kind == "same":
+        if g.get("opposite") and answer == "Yes" and against:  # the fact-check confirmed a claim that contradicts ours
+            return min(cf, cb) >= g.get("opposite_t", t)
+        if g.get("wording") is not None and cos >= g["wording"]:  # almost the same words
+            return True
+        if min(ef, eb) >= t:  # each claim says what the other says
+            return True
+        if g.get("contains") and eb >= t and cos >= g.get("contains_cos", 0.0):  # the checked claim says all ours says
+            return True
+        if g.get("forward_cos") is not None and ef >= t and cos >= g["forward_cos"]:  # ours says all the checked one says
+            return True
+        return False
+    raise ValueError(kind)
+
+
+def gated(rec: dict, g: dict, match_min: float = RCA_BEFORE_MATCH_MIN) -> dict:
+    """The recording as candidate gate `g` sees it: a verdict passage that passes the similarity threshold but not
+    the gate gets similarity 0 (so `verdict_from` leaves it out) and is marked `related`."""
+    from src.verify.model import credibility_from_probs
+
+    items = []
+    for it in rec["items"]:
+        calls = []
+        for c in it["calls"]:
+            m = np.array(c["matches"], dtype=float)
+            related = np.zeros(len(m), dtype=bool)
+            for k in range(len(m)):
+                if np.isnan(m[k]) or m[k] < match_min:
+                    continue
+                against = credibility_from_probs(np.asarray(c["probs"][k], dtype=float))[0] < 0.5
+                if not gate_allows(g, m[k], c["nli"][k], c["answer"][k], against):
+                    related[k] = True
+            m[related] = 0.0
+            calls.append({**c, "matches": m, "related": related, "cosine": np.array(c["matches"], dtype=float)})
+        items.append({**it, "calls": calls})
+    return {**rec, "items": items}
+
+
+def _replay_today(rec: dict, model):
+    return _rca_replay(rec, RCA2_TODAY, model)
+
+
+def rca2_outcomes(rec: dict, g: dict, model, labels: dict, policy: str = "drop") -> list[dict]:
+    """Per item under candidate gate `g`. policy: what a related fact-check (passed similarity, failed the gate)
+    does to the score. "drop": nothing (it may be shown as context). "cap": it votes as today, but without a
+    same-claim passage against the claim the score cannot go below Questionable (31). "hybrid": the score without
+    related fact-checks where there is one; otherwise, if related fact-checks speak against the claim, the score
+    they give today held inside Questionable (31-60)."""
+    strict = gated(rec, g)
+    s_strict, v_strict = _replay_today(strict, model)
+    s_loose, v_loose = _replay_today(rec, model)
+    out = []
+    for it, ss, vs, sl, vl in zip(strict["items"], s_strict, v_strict, s_loose, v_loose):
+        ag_strict = [a for c, v in zip(it["calls"], vs) for a in acting_against(c, v)]
+        ag_loose = [a for c, v in zip(it["calls"], vl) for a in acting_against(c, v)]
+        kept = {a["pair_id"] for a in ag_strict}
+        rel_against = [a for a in ag_loose if a["pair_id"] not in kept]
+        score, acting = ss, ag_strict
+        if policy == "cap":
+            score, acting = sl, ag_loose
+            if not math.isnan(sl) and sl <= 30 and not ag_strict:
+                score = 31.0
+        elif policy == "hybrid" and math.isnan(ss) and not math.isnan(sl) and rel_against:
+            score, acting = float(min(max(sl, 31.0), 60.0)), ag_loose
+        labs = [labels.get(a["pair_id"], "") for a in acting]
+        why = "none" if not acting else "same" if "same claim" in labs else "unlabelled" if "" in labs else "related"
+        out.append({"score": score, "low": bool(not math.isnan(score) and score <= 30),
+                    "credible": bool(not math.isnan(score) and score > 60), "unscored": bool(math.isnan(score)),
+                    "against": acting, "against_why": why, "marked_down": bool(acting),
+                    "related_against": rel_against, "verdicts": [v.label for v in vs]})
+    return out
+
+
+def sign_test(a_only: int, b_only: int) -> float:
+    """Exact two-sided sign test: p for `a_only` changes one way and `b_only` the other."""
+    from scipy.stats import binomtest
+
+    n = a_only + b_only
+    return 1.0 if n == 0 else float(binomtest(a_only, n, 0.5).pvalue)
+
+
+def rca2_dev_metrics(out: list[dict], base: list[dict], y: np.ndarray) -> dict:
+    """The scorecard's dev metrics for one candidate against today's system (`base`)."""
+    s = np.array([o["score"] for o in out], dtype=float)
+    b = bands(y, s)
+    t, f = y == 1.0, y == 0.0
+    low, low0 = np.array([o["low"] for o in out]), np.array([o["low"] for o in base])
+    md, md0 = np.array([o["marked_down"] for o in out]), np.array([o["marked_down"] for o in base])
+    why, why0 = np.array([o["against_why"] for o in out]), np.array([o["against_why"] for o in base])
+    right, right0 = f & low & (why == "same"), f & low0 & (why0 == "same")
+    return {
+        **b,
+        "P1": {"true_low": int((t & low).sum()), "true_low_today": int((t & low0).sum()),
+               "true_low_fixed": int((t & low0 & ~low).sum()), "true_low_new": int((t & low & ~low0).sum()),
+               "true_low_sign_test_p": sign_test(int((t & low0 & ~low).sum()), int((t & low & ~low0).sum())),
+               "true_marked_down": int((t & md).sum()), "true_marked_down_today": int((t & md0).sum()),
+               "true_marked_down_sign_test_p": sign_test(int((t & md0 & ~md).sum()), int((t & md & ~md0).sum()))},
+        "P2": {"fake_low_raw": int((f & low).sum()), "fake_low_right_reason": int(right.sum()),
+               "fake_low_by_luck": int((f & low & (why == "related")).sum()),
+               "fake_low_unlabelled": int((f & low & (why == "unlabelled")).sum()),
+               "fake_low_no_refuting_verdict_passage": int((f & low & (why == "none")).sum()),
+               "right_reason_today": int(right0.sum()), "right_reason_kept": int((right0 & right).sum()),
+               "right_reason_kept_share": float((right0 & right).sum() / max(1, right0.sum())),
+               "right_reason_lost": int((right0 & ~low).sum()),
+               "by_luck_lost": int((f & low0 & (why0 == "related") & ~low).sum()),
+               "fake_credible": int((f & np.array([o["credible"] for o in out])).sum())},
+        "P4": {"unscored_true": int((t & np.isnan(s)).sum()), "unscored_fake": int((f & np.isnan(s)).sum()),
+               "extra_unverified_per_100_claims": float(100 * (np.isnan(s).sum() - sum(o["unscored"] for o in base)) / len(y))},
+    }
+
+
+def rca2_list_metrics(out: list[dict], rec: dict) -> dict:
+    """The scorecard's fixed-list metrics for one candidate."""
+    ids, kinds = rec["ids"], rec["kinds"]
+    by = dict(zip(ids, out))
+    myths = [i for i, k in zip(ids, kinds) if k == "myth"]
+    facts = sorted({i.split("#")[0] for i, k in zip(ids, kinds) if k == "fact"}, key=ids.index)
+
+    def show(o):
+        if o["unscored"]:
+            return "Unverified"
+        return f"{int(o['score'])} {'Low' if o['low'] else 'Credible' if o['credible'] else 'Questionable'}"
+
+    def why(o):
+        return "" if not o["low"] else " (right reason)" if o["against_why"] == "same" else " (by luck)"
+
+    wordings = {f: [by[f]] + [by[f"{f}#{k}"] for k in (1, 2, 3) if f"{f}#{k}" in by] for f in facts}
+    return {
+        "P3_myths": {"n": len(myths), "low": sum(by[m]["low"] for m in myths),
+                     "low_right_reason": sum(by[m]["low"] and by[m]["against_why"] == "same" for m in myths),
+                     "credible": sum(by[m]["credible"] for m in myths), "unverified": sum(by[m]["unscored"] for m in myths),
+                     "each": {m: show(by[m]) + why(by[m]) for m in myths}},
+        "P1_facts": {"n_facts": len(facts), "n_wordings": sum(len(w) for w in wordings.values()),
+                     "wordings_low": sum(o["low"] for w in wordings.values() for o in w),
+                     "facts_any_wording_low": sum(any(o["low"] for o in w) for w in wordings.values()),
+                     "wordings_marked_down": sum(o["marked_down"] for w in wordings.values() for o in w),
+                     "facts_any_wording_marked_down": sum(any(o["marked_down"] for o in w) for w in wordings.values()),
+                     "wordings_credible": sum(o["credible"] for w in wordings.values() for o in w),
+                     "wordings_unverified": sum(o["unscored"] for w in wordings.values() for o in w),
+                     "low_per_fact": {f: sum(o["low"] for o in w) for f, w in wordings.items()},
+                     "each": {f: [show(o) for o in w] for f, w in wordings.items()}},
+        "demo": {i: show(by[i]) for i, k in zip(ids, kinds) if k == "demo"},
+    }
+
+
+def _rca2_recs(model_name: str, compute: bool = False) -> tuple[dict, dict]:
+    """(dev, lists) recordings with the round-1 entailment values and the NLI values of `model_name`."""
+    dev, lists = _rca_rec("dev"), _rca2_lists_rec()
+    table = nli_table([dev, lists], model_name, compute=compute)
+    return with_nli(dev, table), with_nli(lists, table)
+
+
+def rca2_explore(args) -> None:
+    """Dev and list numbers for every gate in RCA2_EXPLORE (one line each): the working table used to design the
+    candidates. Nothing is decided here."""
+    model_name = args.nli or RCA_ROUND1_NLI
+    dev, lists = _rca2_recs(model_name)
+    labels, model = load_labels(), models()["deployed"]
+    y = np.array(dev["labels"], dtype=float)
+    base_dev = rca2_outcomes(dev, {"kind": "today"}, model, labels)
+    for name, (g, policy) in RCA2_EXPLORE.items():
+        od, ol = rca2_outcomes(dev, g, model, labels, policy), rca2_outcomes(lists, g, model, labels, policy)
+        m, lm = rca2_dev_metrics(od, base_dev, y), rca2_list_metrics(ol, lists)
+        p1, p2, mf, mm = m["P1"], m["P2"], lm["P1_facts"], lm["P3_myths"]
+        print(f"{name:26s} T low {p1['true_low']:2d} (-{p1['true_low_fixed']} +{p1['true_low_new']}, p={p1['true_low_sign_test_p']:.3f}) "
+              f"down {p1['true_marked_down']:2d} | F low {p2['fake_low_raw']:3d} right {p2['fake_low_right_reason']:3d} "
+              f"({p2['right_reason_kept_share']:.3f}) luck {p2['fake_low_by_luck']:2d} unl {p2['fake_low_unlabelled']} "
+              f"cred {p2['fake_credible']} | none T {m['P4']['unscored_true']} F {m['P4']['unscored_fake']} | AUC "
+              f"{m.get('roc_auc_scored', float('nan')):.3f} | facts low {mf['wordings_low']:2d}/{mf['n_wordings']} "
+              f"({mf['facts_any_wording_low']} facts) down {mf['wordings_marked_down']:2d} cred {mf['wordings_credible']} | "
+              f"myths low {mm['low']:2d} right {mm['low_right_reason']:2d} cred {mm['credible']}", flush=True)
+        if getattr(args, "out", None):
+            with open(args.out, "a", encoding="utf-8") as f:
+                f.write(json.dumps(_json_safe({"gate": name, "nli": model_name, "dev": {k: m[k] for k in ("P1", "P2", "P4")},
+                                               "lists": lm})) + "\n")
+
+
+def _explore_grid() -> dict:
+    out = {"today": ({"kind": "today"}, "drop"), "forward (round 1)": ({"kind": "forward", "t": 0.5}, "drop"),
+           "both": ({"kind": "both", "t": 0.5}, "drop"), "contains": ({"kind": "contains", "t": 0.5}, "drop"),
+           "opposite only": ({"kind": "same", "t": 2.0, "opposite": True, "opposite_t": 0.5}, "drop")}
+    for cc in (0.0, 0.6, 0.65, 0.7, 0.75):
+        for fc in (None, 0.7, 0.75, 0.8, 0.85, 0.9):
+            for t in (0.5,):
+                out[f"c{cc:.2f} f{fc if fc else '-'} t{t}"] = (
+                    {"kind": "same", "t": t, "contains": True, "contains_cos": cc, "forward_cos": fc, "opposite": True}, "drop")
+    return out
+
+
+RCA2_EXPLORE = _explore_grid()
+
+
+# --- round 2: the comparison ---------------------------------------------------------------------------
+# Candidates. (a) and (b) are fixed by the task. (c) and (d) were designed on the dev set and the fixed lists
+# (working table: stage "explore"), after the scorecard above was committed:
+#   What the dev pairs showed. Of the 206 dev fakes rated Low today, 171 have a fact-check of the same claim among
+#   the passages that count against them (hand labels) and 35 only fact-checks of related claims. Round 1's test
+#   ("our claim must imply the checked claim") kept 153 of the 171: fact-checkers word a rumour more fully than a
+#   user does ("Video shows PM Modi using curse words at a rally in Gujarat" for "Modi used curse words at a rally
+#   in Gujarat"), so the checked claim implies ours and not the other way round. It also let through generic
+#   captions that true reports imply ("Indian Army kills terrorists in an encounter in Kashmir", rated False for
+#   one video) and verdicts that have expired ("Pope Francis had passed away", rated False before he died).
+#   (c) therefore asks "do the two claims say the same thing?":
+#       each claim implies the other; or
+#       the checked claim implies ours and the wording is close (cosine >= 0.70); or
+#       ours implies the checked claim and the wording is very close (cosine >= 0.90); and
+#       a fact-check that CONFIRMED a claim counts against ours only if the two contradict each other
+#       ("Vaccines do not cause autism", rated True, against "Vaccines cause autism").
+#   (d) keeps (c)'s test and changes what a related fact-check does: shown as context only (same scores as (c)),
+#   or allowed to lower a score to Questionable but never to Low ("cap"), or used only when nothing else speaks
+#   ("hybrid").
+RCA2_SAME = {"kind": "same", "t": 0.5, "contains": True, "contains_cos": 0.70, "forward_cos": 0.90, "opposite": True}
+RCA2_CANDIDATES = {
+    "a_today": {"gate": {"kind": "today"}, "policy": "drop",
+                "what": "today's system: a fact-check counts when its claim is similar to ours (cosine >= 0.55)"},
+    "b_round1": {"gate": {"kind": "forward", "t": 0.5}, "policy": "drop",
+                 "what": "round 1: also, our claim must imply the checked claim (for a fact-check that speaks against ours)"},
+    "c_mutual": {"gate": {"kind": "both", "t": 0.5}, "policy": "drop",
+                 "what": "strictest: each claim must imply the other"},
+    "c_same_claim": {"gate": RCA2_SAME, "policy": "drop",
+                     "what": "improved test: the two claims say the same thing (see RCA2_SAME); a related fact-check "
+                             "does not count"},
+    "d_context": {"gate": RCA2_SAME, "policy": "drop", "shows_related": True,
+                  "what": "workaround 1: as c_same_claim, and a related fact-check is shown to the user as context "
+                          "(the score is the same as c_same_claim)"},
+    "d_cap": {"gate": RCA2_SAME, "policy": "cap",
+              "what": "workaround 2: a related fact-check still votes, but without a same-claim fact-check the score "
+                      "cannot go below Questionable (31)"},
+    "d_hybrid": {"gate": RCA2_SAME, "policy": "hybrid",
+                 "what": "workaround 3: as c_same_claim where anything else speaks; a claim that would be Unverified "
+                         "but has related fact-checks against it is held in Questionable (31-60)"},
+}
+RCA2_NLI = RCA_ROUND1_NLI  # the NLI model of the candidates (others are compared in stage "models")
+
+
+def _band(o: dict) -> str:
+    return "Unverified" if o["unscored"] else "Low" if o["low"] else "Credible" if o["credible"] else "Questionable"
+
+
+def rca2_rule(m: dict, lm: dict, by: dict, m0: dict, lm0: dict, by0: dict) -> dict:
+    """The scorecard's recommendation rule, parts (1)-(3), for one candidate against today's system (suffix 0).
+    `by`: list id -> outcome."""
+    p1, p2 = m["P1"], m["P2"]
+    facts, facts0 = lm["P1_facts"]["low_per_fact"], lm0["P1_facts"]["low_per_fact"]
+    myths = [k for k in RCA2_MYTHS if k in by]
+    right0 = [k for k in myths if by0[k]["low"] and by0[k]["against_why"] == "same"]
+    lost = [k for k in right0 if not (by[k]["low"] and by[k]["against_why"] == "same")]
+    checks = {
+        "1_materially_fewer_true_low": bool(p1["true_low_fixed"] > p1["true_low_new"] and p1["true_low_sign_test_p"] < 0.05),
+        "1_no_more_true_marked_down": bool(p1["true_marked_down"] <= p1["true_marked_down_today"]),
+        "1_no_fact_low_in_more_wordings": all(facts[f] <= facts0[f] for f in facts),
+        "2_keeps_90pct_right_reason": bool(p2["right_reason_kept_share"] >= RCA2_KEEP_RIGHT_REASON),
+        "2_fakes_credible_at_most_5pct": bool(p2["fake_credible"] <= 0.05 * m["fake"]["n"]),
+        "3_no_myth_credible": lm["P3_myths"]["credible"] == 0,
+        "3_at_most_one_right_reason_myth_lost": len(lost) <= 1,
+        "3_injection_gets_band_of_plain_claim": _band(by["M05"]) == _band(by["M01"]),
+        "3_gaya_farmer_unverified": by["D01"]["unscored"],
+    }
+    return {"checks": checks, "right_reason_myths_lost": lost, "meets_1_to_3": all(checks.values())}
+
+
+RCA2_COST_ORDER = ("a_today", "c_same_claim", "c_mutual", "b_round1", "d_context", "d_cap", "d_hybrid")  # cheapest first
+RCA2_DEPARTURE = (
+    "The rule's last tie-break is 'the cheapest', which picks c_same_claim over d_context: the two give the same "
+    "score for every claim. d_context is recommended because it only adds what the user is shown (a fact-check of a "
+    "related claim appears as context under an Unverified answer, marked as not used), which is the one cheap answer "
+    "to priority 4 ('Unverified is not free'), and the claim card already shows uncounted passages. Its effect on "
+    "usefulness was not measured (no ratings exist for it). Every measured number of the two is identical.")
+
+
+def rca2_pick(results: dict, outs: dict, y: np.ndarray) -> tuple[str | None, list[str]]:
+    """The recommendation rule's ordering among the candidates that meet (1)-(3)."""
+    names = [n for n in results if results[n]["rule"]["meets_1_to_3"]]
+    steps = [f"meet (1)-(3): {names}"]
+    if not names:
+        return None, steps + ["none: keep today's system"]
+    t = y == 1.0
+
+    def narrow(names, flag, what):
+        arr = {n: np.array([o[flag] for o in outs[n]]) & t for n in names}
+        best = min(names, key=lambda n: arr[n].sum())
+        keep = [n for n in names if n == best or sign_test(int((arr[n] & ~arr[best]).sum()),
+                                                           int((arr[best] & ~arr[n]).sum())) >= 0.05]
+        steps.append(f"{what}: {({n: int(arr[n].sum()) for n in names})}; not materially worse than the best ({best}): {keep}")
+        return keep
+
+    names = narrow(names, "low", "true dev claims rated Low")
+    names = narrow(names, "marked_down", "true dev claims marked down")
+    for key, what, sign in (("fake_low_right_reason", "right-reason Low fakes", -1),):
+        vals = {n: results[n]["dev"]["P2"][key] for n in names}
+        names = [n for n in names if vals[n] == max(vals.values())]
+        steps.append(f"{what}: {vals}; most: {names}")
+    vals = {n: results[n]["dev"]["P4"]["unscored_true"] + results[n]["dev"]["P4"]["unscored_fake"] for n in names}
+    names = [n for n in names if vals[n] == min(vals.values())]
+    steps.append(f"Unverified answers on dev: {vals}; fewest: {names}")
+    pick = min(names, key=RCA2_COST_ORDER.index)
+    steps.append(f"cheapest of {names}: {pick}")
+    return pick, steps
+
+
+def rca2_live(args) -> None:
+    """The named inputs through the real pipeline with the same-claim test switched on by the environment
+    (NEWSCRED_ENTAIL_MODE=same): what the app would show after the change, on today's evidence. Lookups come from
+    the caches where they can; live searches are counted and saved."""
+    from src.pipeline import NewsItem, Pipeline
+    from src.verify import model as vm
+
+    texts = rca2_list_texts()
+    ids = list(RCA2_NAMED_MYTHS) + ["D01", "D02", "T06"] + list(RCA_CASES)
+    pipe = Pipeline()
+    verifier = pipe.get("verifier")
+    out = {"entail_mode": verifier.entail_mode, "nli_model": vm.ENTAIL_MODEL, "inputs": {}}
+    print("mode:", verifier.entail_mode, "| NLI model loaded lazily:", vm.ENTAIL_MODEL, flush=True)
+    for lid in ids:
+        rep = pipe.analyze(NewsItem(text=texts[lid][1]))
+        related = [f"{f['publisher']}: {f['rating']} ({f['claim_reviewed'][:70]})" for c in rep["claims"]
+                   for f in c.get("related_fact_checks", [])]
+        out["inputs"][lid] = {"text": texts[lid][1], "score": rep["score"], "band": rep["band"],
+                              "verdicts": [c.get("verdict") for c in rep["claims"]], "related_fact_checks": related}
+        print(f"{lid}: {rep['score']} {rep['band']} {[c.get('verdict') for c in rep['claims']]} | related: {related[:2]}", flush=True)
+    out["live_searches"] = {n: {"live": pipe.get(n).calls, "from_cache": pipe.get(n).cache_hits}
+                            for n in ("factcheck", "news") if pipe.get(n) is not None}
+    print("live searches:", out["live_searches"])
+    report = json.loads(RCA2_REPORT.read_text()) if RCA2_REPORT.exists() else {}
+    report[f"named_inputs_through_the_pipeline_mode_{verifier.entail_mode}"] = out
+    RCA2_REPORT.write_text(json.dumps(_json_safe(report), indent=2))
+
+
+def rca2_compare(args) -> dict:
+    """Every candidate on the dev set and the fixed lists, by the scorecard; the lost fakes; the report."""
+    import csv
+
+    dev, lists = _rca2_recs(RCA2_NLI)
+    labels, model = load_labels(), models()["deployed"]
+    y = np.array(dev["labels"], dtype=float)
+    texts = load_set("dev")["text"].tolist()
+    outs = {n: (rca2_outcomes(dev, c["gate"], model, labels, c["policy"]),
+                rca2_outcomes(lists, c["gate"], model, labels, c["policy"])) for n, c in RCA2_CANDIDATES.items()}
+    od0, ol0 = outs["a_today"]
+    m0, lm0, by0 = rca2_dev_metrics(od0, od0, y), rca2_list_metrics(ol0, lists), dict(zip(lists["ids"], ol0))
+    results = {}
+    for n, (od, ol) in outs.items():
+        m, lm, by = rca2_dev_metrics(od, od0, y), rca2_list_metrics(ol, lists), dict(zip(lists["ids"], ol))
+        named = {k: _band(by[k]) + (f" {int(by[k]['score'])}" if not by[k]["unscored"] else "")
+                 for k in list(RCA2_NAMED_MYTHS) + ["D01", "D02", "T06"]}
+        results[n] = {"what": RCA2_CANDIDATES[n]["what"], "gate": RCA2_CANDIDATES[n]["gate"],
+                      "policy": RCA2_CANDIDATES[n]["policy"], "dev": m, "lists": lm, "named_inputs": named,
+                      "rule": rca2_rule(m, lm, by, m0, lm0, by0)}
+        p1, p2, mf, mm = m["P1"], m["P2"], lm["P1_facts"], lm["P3_myths"]
+        print(f"{n:13s} TRUE low {p1['true_low']:2d}/{m['true']['n']} ({m['true']['low']:.3f}) marked down "
+              f"{p1['true_marked_down']:2d} cred {m['true']['credible']:.3f} none {m['true']['no_score']:.3f} | FAKE low "
+              f"{p2['fake_low_raw']:3d} ({m['fake']['low']:.3f}) = right {p2['fake_low_right_reason']:3d} + luck "
+              f"{p2['fake_low_by_luck']:2d}; right kept {p2['right_reason_kept_share']:.3f} cred {p2['fake_credible']} none "
+              f"{m['fake']['no_score']:.3f} | AUC {m.get('roc_auc_scored', float('nan')):.3f} | facts low "
+              f"{mf['wordings_low']}/{mf['n_wordings']} down {mf['wordings_marked_down']} | myths low {mm['low']} right "
+              f"{mm['low_right_reason']} cred {mm['credible']} | extra unverified per 100: "
+              f"{m['P4']['extra_unverified_per_100_claims']:.1f} | rule (1)-(3): "
+              f"{'meets' if results[n]['rule']['meets_1_to_3'] else 'fails ' + str([k for k, v in results[n]['rule']['checks'].items() if not v])}",
+              flush=True)
+    pick, steps = rca2_pick(results, {n: od for n, (od, _) in outs.items()}, y)
+    print("the rule picks:", pick, "| recommended:", RCA2_RECOMMENDED)
+    for s in steps:
+        print("   ", s)
+    # Lost fakes: every dev fake that today's system rates Low and some candidate does not.
+    rows = []
+    for i in np.flatnonzero((y == 0.0) & np.array([o["low"] for o in od0])):
+        lost_by = [n for n, (od, _) in outs.items() if not od[i]["low"]]
+        if not lost_by:
+            continue
+        against = od0[i]["against"]
+        fake_label = ("same claim" if any(labels.get(a["pair_id"]) == "same claim" for a in against) else "related claim")
+        for a in against:
+            rows.append({"dev_item": int(i), "our_claim": texts[i], "claim_sentence_matched": a["our_claim"],
+                         "checked_claim": a["checked_claim"], "rating": a["rating"], "outlet": a["outlet"],
+                         "label": labels.get(a["pair_id"], "") or "(not labelled: the fake has a same-wording fact-check)",
+                         "label_of_the_fake": fake_label, "score_today": int(od0[i]["score"]),
+                         "not_low_under": "; ".join(lost_by),
+                         **{f"outcome_{n}": _band(od[i]) for n, (od, _) in outs.items() if n != "a_today"}})
+    with open(RCA2_LOST, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    n_fakes = len({r["dev_item"] for r in rows})
+    print(f"lost fakes: {n_fakes} dev fakes ({len(rows)} rows) | saved {RCA2_LOST}")
+    # How much the result depends on the three thresholds of the same-claim test (one changed at a time).
+    sensitivity = []
+    for key, values in (("t", (0.3, 0.5, 0.7, 0.9)), ("contains_cos", (0.6, 0.65, 0.7, 0.75, 0.8)),
+                        ("forward_cos", (0.8, 0.85, 0.9, 0.95))):
+        for v in values:
+            g = {**RCA2_SAME, key: v}
+            m = rca2_dev_metrics(rca2_outcomes(dev, g, model, labels), od0, y)
+            lm = rca2_list_metrics(rca2_outcomes(lists, g, model, labels), lists)
+            sensitivity.append({"changed": key, "value": v, "true_low": m["P1"]["true_low"],
+                                "true_marked_down": m["P1"]["true_marked_down"], "fake_low": m["P2"]["fake_low_raw"],
+                                "fake_low_right_reason": m["P2"]["fake_low_right_reason"],
+                                "fake_low_by_luck": m["P2"]["fake_low_by_luck"],
+                                "facts_wordings_low": lm["P1_facts"]["wordings_low"],
+                                "facts_wordings_marked_down": lm["P1_facts"]["wordings_marked_down"],
+                                "myths_low_right_reason": lm["P3_myths"]["low_right_reason"],
+                                "myths_credible": lm["P3_myths"]["credible"]})
+            print(f"  sensitivity {key}={v}: true low {sensitivity[-1]['true_low']} marked down "
+                  f"{sensitivity[-1]['true_marked_down']} | fake low {sensitivity[-1]['fake_low']} right "
+                  f"{sensitivity[-1]['fake_low_right_reason']} luck {sensitivity[-1]['fake_low_by_luck']} | facts low "
+                  f"{sensitivity[-1]['facts_wordings_low']} down {sensitivity[-1]['facts_wordings_marked_down']} | myths right "
+                  f"{sensitivity[-1]['myths_low_right_reason']} cred {sensitivity[-1]['myths_credible']}", flush=True)
+    report = json.loads(RCA2_REPORT.read_text()) if RCA2_REPORT.exists() else {}
+    report.update({"scorecard": ROOT_CAUSE_A_SCORECARD, "nli_model": RCA2_NLI, "nli_model_licence": "MIT",
+                   "same_claim_test": RCA2_SAME, "sensitivity_of_the_same_claim_test": sensitivity,
+                   "setting": "India dev set (227 true, 300 fake), news and Wikipedia confirm-only, time rule, deployed "
+                              "meta-learner; fixed lists recorded through the pipeline on 2026-11-12",
+                   "labels": {"file": str(RCA2_LABELS.relative_to(ROOT)).replace("\\", "/"),
+                              "counts": {k: sum(v == k for v in labels.values()) for k in ("same claim", "related claim", "")}},
+                   "lists_live_searches": _load(RCA2_LISTS)["live_searches"],
+                   "candidates": results, "rule_pick": pick, "rule_steps": steps, "recommended": RCA2_RECOMMENDED,
+                   "departure_from_the_rule": RCA2_DEPARTURE if pick != RCA2_RECOMMENDED else None,
+                   "lost_fakes_file": str(RCA2_LOST.relative_to(ROOT)).replace("\\", "/"),
+                   "lost_fakes": n_fakes})
+    RCA2_REPORT.write_text(json.dumps(_json_safe(report), indent=2))
+    print("saved", RCA2_REPORT)
+    return report
+
+
+RCA2_SERVED = {"family": "same", "match_min": RCA_BEFORE_MATCH_MIN, "entail_mode": "same", "entail_min": 0.5}
+RCA2_NLI_MODELS = {  # name -> licence (from the model cards on Hugging Face, read 2026-11-12)
+    RCA_ROUND1_NLI: "MIT",
+    "cross-encoder/nli-deberta-v3-xsmall": "Apache-2.0",
+    "cross-encoder/nli-deberta-v3-small": "Apache-2.0",
+    "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli": "MIT",
+}
+
+
+def rca2_served_check(args) -> None:
+    """The same-claim test as written in src/verify/model.py (mode "same", through `verdict_from`) must give the
+    scores of the measurement prototype (`gated`) for every dev claim and list input."""
+    from src.verify import model as vm
+
+    assert (vm.SAME_CONTAINS_COS, vm.SAME_FORWARD_COS, vm.ENTAIL_MIN) == (
+        RCA2_SAME["contains_cos"], RCA2_SAME["forward_cos"], RCA2_SAME["t"]), "the code's thresholds differ from RCA2_SAME"
+    model = models()["deployed"]
+    for name, rec in zip(("dev", "lists"), _rca2_recs(RCA2_NLI)):
+        a, _ = _replay_today(gated(rec, RCA2_SAME), model)
+        b, vs = _rca_replay(rec, RCA2_SERVED, model)
+        diff = int(np.sum(~((a == b) | (np.isnan(a) & np.isnan(b)))))
+        related = sum(e.related for v in vs for x in v for e in x.evidence)
+        print(f"{name}: {len(a)} items, scores that differ between the prototype and the code: {diff}; passages "
+              f"marked related by the code: {related}")
+        if diff:
+            raise SystemExit("the code does not reproduce the measured candidate")
+
+
+def rca2_models(args) -> None:
+    """The same-claim test with each NLI model in RCA2_NLI_MODELS (dev and lists): does a smaller or a larger
+    model change the result?"""
+    labels, model = load_labels(), models()["deployed"]
+    out = {}
+    for name, licence in RCA2_NLI_MODELS.items():
+        dev, lists = _rca2_recs(name)
+        y = np.array(dev["labels"], dtype=float)
+        base = rca2_outcomes(dev, {"kind": "today"}, model, labels)
+        od, ol = rca2_outcomes(dev, RCA2_SAME, model, labels), rca2_outcomes(lists, RCA2_SAME, model, labels)
+        m, lm = rca2_dev_metrics(od, base, y), rca2_list_metrics(ol, lists)
+        p1, p2, mf, mm = m["P1"], m["P2"], lm["P1_facts"], lm["P3_myths"]
+        out[name] = {"licence": licence, "dev": {k: m[k] for k in ("P1", "P2", "P4")}, "true": m["true"], "fake": m["fake"],
+                     "roc_auc_scored": m.get("roc_auc_scored"), "lists": lm}
+        print(f"{name:58s} T low {p1['true_low']} down {p1['true_marked_down']} | F low {p2['fake_low_raw']} right "
+              f"{p2['fake_low_right_reason']} ({p2['right_reason_kept_share']:.3f}) luck {p2['fake_low_by_luck']} | facts low "
+              f"{mf['wordings_low']} down {mf['wordings_marked_down']} | myths low {mm['low']} right "
+              f"{mm['low_right_reason']} cred {mm['credible']} | not Low: "
+              f"{[k for k, v in mm['each'].items() if 'Low' not in v]}", flush=True)
+    report = json.loads(RCA2_REPORT.read_text()) if RCA2_REPORT.exists() else {}
+    report["nli_models_with_the_same_claim_test"] = out
+    RCA2_REPORT.write_text(json.dumps(_json_safe(report), indent=2))
+
+
+def rca2_cost(args) -> None:
+    """Practical cost of the same-claim test on CPU: how many claim pairs one analysed claim sends to the NLI
+    model (from the dev recordings), and the time, file size and memory of each model."""
+    import os
+    import time
+
+    import torch
+
+    from src.verify.model import ClaimEntailment, claim_behind
+
+    dev = _rca_rec("dev")
+    counts, pairs = [], []
+    for it in dev["items"]:
+        for c in it["calls"]:
+            ps = [(c["claim"], claim_behind(h.passage)) for h, m in zip(c["hits"], c["matches"])
+                  if not np.isnan(m) and m >= RCA_BEFORE_MATCH_MIN]
+            counts.append(2 * len(ps))  # both directions
+            pairs += ps
+    counts = np.array(counts)
+    busy = counts[counts > 0]
+    sizes = {"median": int(np.median(busy)), "p95": int(np.percentile(busy, 95)), "max": int(busy.max())}
+    print(f"analysed dev claims: {len(counts)}; with no fact-check to test (no NLI call): {np.mean(counts == 0):.3f}; "
+          f"pairs per claim when there is one: {sizes}; CPU threads: {torch.get_num_threads()}", flush=True)
+    try:
+        import psutil
+
+        rss = lambda: psutil.Process(os.getpid()).memory_info().rss / 1e6  # noqa: E731
+    except ImportError:
+        rss = lambda: float("nan")  # noqa: E731
+    out = {"pairs_per_claim": sizes, "share_of_claims_without_nli_call": float(np.mean(counts == 0)),
+           "cpu_threads": torch.get_num_threads(), "models": {}}
+    names = [args.nli] if args.nli else list(RCA2_NLI_MODELS)
+    for name in names:
+        before = rss()
+        t0 = time.perf_counter()
+        ent = ClaimEntailment(name, device="cpu")
+        ent._load()
+        load_s = time.perf_counter() - t0
+        mb = sum(p.numel() * p.element_size() for p in ent._model.parameters()) / 1e6
+        entry = {"licence": RCA2_NLI_MODELS.get(name), "weights_mb_in_memory": round(mb), "load_seconds": round(load_s, 1),
+                 "process_memory_added_mb": round(rss() - before)}
+        ent._infer2([(a, b) for a, b in pairs[:4]])  # warm-up
+        for label, n in sizes.items():
+            times = []
+            for r in range(5):
+                chunk = pairs[r * 7: r * 7 + n // 2]
+                both = [(a, b) for a, b in chunk] + [(b, a) for a, b in chunk]
+                t0 = time.perf_counter()
+                ent._infer2(both)
+                times.append(time.perf_counter() - t0)
+            entry[f"seconds_{label}_claim"] = round(float(np.median(times)), 2)
+        out["models"][name] = entry
+        print(name, entry, flush=True)
+        del ent
+    report = json.loads(RCA2_REPORT.read_text()) if RCA2_REPORT.exists() else {}
+    report["cost_on_cpu"] = out
+    RCA2_REPORT.write_text(json.dumps(_json_safe(report), indent=2))
+
+
+RCA2_RECOMMENDED = "d_context"  # set after the dev comparison (stage "compare"); scores as c_same_claim
+
+
+def _drop_same_wording(rec: dict) -> dict:
+    """`drop_same_claim` for a recording that also carries the round-2 NLI values."""
+    def keep(m):
+        return np.isnan(m) or m < OWN_CLAIM
+
+    out = drop_same_claim(rec)
+    items = []
+    for it0, it in zip(rec["items"], out["items"]):
+        calls = []
+        for c0, c in zip(it0["calls"], it["calls"]):
+            k = [keep(m) for m in c0["matches"]]
+            calls.append({**c, "nli": np.array([e for e, ok in zip(c0["nli"], k) if ok], dtype=float).reshape(-1, 4),
+                          "answer": [a for a, ok in zip(c0["answer"], k) if ok]})
+        items.append({**it, "calls": calls})
+    return {**out, "items": items}
+
+
+def rca2_test(args) -> dict:
+    """The test, matched and hoax sets, once each, for today's system and the recommended candidate only (the code
+    in src/verify/model.py, mode "same"). Round 1 scored these sets once for its own candidate; that result stays
+    in reports/root_cause_a_eval.json. Refuses to run twice."""
+    report = json.loads(RCA2_REPORT.read_text())
+    if "test_sets" in report:
+        raise SystemExit("the test sets were already scored once for round 2 (reports/root_cause_a_round2.json)")
+    model = models()["deployed"]
+    out = {"recommended": RCA2_RECOMMENDED, "scored_with": {**RCA2_SERVED, "nli_model": RCA2_NLI, **RCA2_SAME},
+           "note": "today's system and the recommended candidate only; nothing was chosen on these sets"}
+    for name in ("test", "matched", "hoax"):
+        rec = _rca_rec(name)
+        rec = with_nli(rec, nli_table([rec], RCA2_NLI, compute=True))
+        y = np.array(rec["labels"], dtype=float)
+        entry = {}
+        for when, setting in (("today", RCA2_TODAY), ("recommended", RCA2_SERVED)):
+            s, vs = _rca_replay(rec, setting, model)
+            strict, _ = _rca_replay(_drop_same_wording(rec), setting, model)
+            low = ~np.isnan(s) & (s <= 30)
+            against = [[a for c, v in zip(it["calls"], v_item) for a in acting_against(c, v)]
+                       for it, v_item in zip(rec["items"], vs)]
+            has_against = np.array([bool(a) for a in against])
+            same_wording = np.array([any(x["cosine"] >= RCA2_SAME_WORDING for x in a) for a in against])
+            entry[when] = {
+                **bands(y, s),
+                "true_marked_down": int(((y == 1.0) & has_against).sum()),
+                "fake_low": int(((y == 0.0) & low).sum()),
+                "fake_low_with_a_same_wording_fact_check": int(((y == 0.0) & low & same_wording).sum()),
+                "fake_low_without_one": int(((y == 0.0) & low & ~same_wording).sum()),
+                "strict_own_fact_check_removed": bands(y, strict)}
+            if name == "hoax":
+                split = _hoax_split("hoax")
+                entry[when]["by_split"] = {part: bands(y[split == part], s[split == part]) for part in ("dev", "test")}
+            entry[when]["_low"] = low
+        t, r = entry["today"], entry["recommended"]
+        lt, lr = t.pop("_low"), r.pop("_low")
+        if name != "hoax":
+            tm = y == 1.0
+            entry["true_low_sign_test_p"] = sign_test(int((tm & lt & ~lr).sum()), int((tm & lr & ~lt).sum()))
+            print(f"{name}: TRUE low {t['true']['low']:.4f} -> {r['true']['low']:.4f} (p={entry['true_low_sign_test_p']:.4f}), "
+                  f"marked down {t['true_marked_down']} -> {r['true_marked_down']}, cred {t['true']['credible']:.4f} -> "
+                  f"{r['true']['credible']:.4f}, none {t['true']['no_score']:.4f} -> {r['true']['no_score']:.4f} | FAKE low "
+                  f"{t['fake']['low']:.4f} -> {r['fake']['low']:.4f} (with a same-wording fact-check {t['fake_low_with_a_same_wording_fact_check']} "
+                  f"-> {r['fake_low_with_a_same_wording_fact_check']}, without {t['fake_low_without_one']} -> "
+                  f"{r['fake_low_without_one']}), cred {t['fake']['credible']:.4f} -> {r['fake']['credible']:.4f}, none "
+                  f"{t['fake']['no_score']:.4f} -> {r['fake']['no_score']:.4f} | AUC {t.get('roc_auc_scored', float('nan')):.4f} -> "
+                  f"{r.get('roc_auc_scored', float('nan')):.4f} | strict fake low "
+                  f"{t['strict_own_fact_check_removed']['fake']['low']:.4f} -> "
+                  f"{r['strict_own_fact_check_removed']['fake']['low']:.4f}", flush=True)
+        else:
+            print(f"hoax: low {t['fake']['low']:.4f} -> {r['fake']['low']:.4f}, cred {t['fake']['credible']:.4f} -> "
+                  f"{r['fake']['credible']:.4f}, none {t['fake']['no_score']:.4f} -> {r['fake']['no_score']:.4f} | with a "
+                  f"same-wording fact-check {t['fake_low_with_a_same_wording_fact_check']} -> "
+                  f"{r['fake_low_with_a_same_wording_fact_check']}, without {t['fake_low_without_one']} -> "
+                  f"{r['fake_low_without_one']}", flush=True)
+        out[name] = entry
+    report["test_sets"] = out
+    RCA2_REPORT.write_text(json.dumps(_json_safe(report), indent=2))
+    print("saved", RCA2_REPORT)
+    return report
+
+
 def _load(name: str) -> dict:
     with open(CACHE / f"{name}.pkl", "rb") as f:
         return pickle.load(f)
@@ -1826,6 +2610,18 @@ RCA2_STAGES = {
     "lists": lambda a: record_lists(),          # record the three fixed lists (live lookups, allowance-guarded)
     "reword": lambda a: reword_lists(),         # the facts in three rewordings each, on the recorded evidence
     "sheet": lambda a: label_sheet(a.out),      # passages acting against today's Low dev fakes, for hand labels
+    "label": lambda a: write_labels(a.labels),  # hand labels -> reports/root_cause_a_labels.csv
+    "pairs": lambda a: dump_pairs(a.out),       # diagnostic sheet of the dev claim pairs (round-1 entailment values)
+    "pairs-lists": lambda a: dump_pairs(a.out, "lists"),
+    "entail-lists": lambda a: print(len(_verdict_pairs(_rca2_lists_rec(compute=True))), "verdict passages in the lists"),
+    "nli": lambda a: print(len(nli_table([_rca_rec("dev"), _rca2_lists_rec()], a.nli or RCA_ROUND1_NLI, compute=True)), "claim pairs"),
+    "explore": lambda a: rca2_explore(a),       # working table: every gate in RCA2_EXPLORE on dev and the lists
+    "compare": lambda a: rca2_compare(a),       # the comparison: every candidate by the scorecard, lost fakes, report
+    "served-check": lambda a: rca2_served_check(a),  # the code in src/verify/model.py reproduces the candidate
+    "models": lambda a: rca2_models(a),         # the same-claim test with other NLI models
+    "cost": lambda a: rca2_cost(a),             # CPU time, size and memory of the NLI models
+    "test": lambda a: rca2_test(a),             # test, matched and hoax sets, once: today's system and the recommendation
+    "live": lambda a: rca2_live(a),             # the named inputs through the real pipeline (mode from NEWSCRED_ENTAIL_MODE)
 }
 
 
