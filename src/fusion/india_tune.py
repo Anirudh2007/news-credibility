@@ -1871,8 +1871,106 @@ def write_labels(hand_path: str) -> None:
 def load_labels() -> dict[str, str]:
     import csv
 
-    with open(RCA2_LABELS, encoding="utf-8") as f:
-        return {r["pair_id"]: r["label"] for r in csv.DictReader(f)}
+    out = {}
+    for path in (RCA2_LABELS, RCA2_LABELS_TEST):
+        if path.exists():
+            with open(path, encoding="utf-8") as f:
+                out.update({r["pair_id"]: r["label"] for r in csv.DictReader(f) if r["label"] or r["pair_id"] not in out})
+    return out
+
+
+RCA2_LABELS_TEST = ROOT / "reports" / "root_cause_a_labels_test.csv"
+
+
+def _today_low_fakes(name: str):
+    """(item number, item text, passages acting against it today) for every fake of a set that today's system
+    rates Low."""
+    rec = _rca_rec(name)
+    y = np.array(rec["labels"], dtype=float)
+    texts = load_set(name)["text"].tolist()
+    scores, verdicts = _rca_replay(rec, RCA2_TODAY, models()["deployed"])
+    for i, (it, s, vs) in enumerate(zip(rec["items"], scores, verdicts)):
+        if y[i] == 0.0 and not math.isnan(s) and s <= 30:
+            yield i, texts[i], [a for c, v in zip(it["calls"], vs) for a in acting_against(c, v)]
+
+
+def label_sheet_sets(out: str) -> None:
+    """As `label_sheet`, for the test, matched and hoax sets: the passages that count against the fakes rated Low
+    today that have no same-wording passage. Written after the sets were scored, without any outcome of the
+    recommended candidate, so the labels are blind to what it keeps."""
+    import csv
+
+    rows = []
+    for name in ("test", "matched", "hoax"):
+        for i, text, against in _today_low_fakes(name):
+            if any(a["cosine"] >= RCA2_SAME_WORDING for a in against):
+                continue
+            for a in against:
+                rows.append({"set": name, "item": i, "pair_id": a["pair_id"], "item_text": text, "our_claim": a["our_claim"],
+                             "checked_claim": a["checked_claim"], "rating": a["rating"], "outlet": a["outlet"]})
+    with open(out, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    print(f"{len(rows)} passages, {len({r['pair_id'] for r in rows})} distinct pairs, "
+          f"{len({(r['set'], r['item']) for r in rows})} fakes | {out}")
+
+
+def write_labels_sets(hand_path: str) -> None:
+    """reports/root_cause_a_labels_test.csv from the hand labels of `label_sheet_sets`."""
+    import csv
+
+    hand = {r["pair_id"]: r for r in csv.DictReader(open(hand_path, encoding="utf-8"))}
+    rows = {}
+    for name in ("test", "matched", "hoax"):
+        for i, text, against in _today_low_fakes(name):
+            auto = any(a["cosine"] >= RCA2_SAME_WORDING for a in against)
+            for a in against:
+                if a["cosine"] >= RCA2_SAME_WORDING:
+                    label, how, note = "same claim", "automatic: almost the same wording (cosine >= 0.95)", ""
+                elif auto:
+                    label, how, note = "", "not labelled: the item has a same-wording passage", ""
+                elif a["pair_id"] in hand:
+                    label, how, note = hand[a["pair_id"]]["label"], "by hand", hand[a["pair_id"]].get("note", "")
+                else:
+                    raise SystemExit(f"no label for pair {a['pair_id']} ({name} item {i})")
+                rows.setdefault(a["pair_id"], {
+                    "pair_id": a["pair_id"], "set": name, "our_claim": a["our_claim"], "checked_claim": a["checked_claim"],
+                    "rating": a["rating"], "outlet": a["outlet"], "label": label, "labelled": how, "note": note})
+    with open(RCA2_LABELS_TEST, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(next(iter(rows.values()))))
+        w.writeheader()
+        w.writerows(rows.values())
+    print(f"{len(rows)} pairs | saved {RCA2_LABELS_TEST}")
+
+
+def rca2_test_split(args) -> None:
+    """The right-reason split of the test, matched and hoax fakes rated Low, for today's system and the recommended
+    candidate, from the hand labels. The two systems are replayed exactly as in stage "test" (the Low counts must
+    equal the saved ones); nothing new is scored."""
+    report = json.loads(RCA2_REPORT.read_text())
+    labels, model = load_labels(), models()["deployed"]
+    for name in ("test", "matched", "hoax"):
+        rec = _rca_rec(name)
+        rec = with_nli(rec, nli_table([rec], RCA2_NLI))
+        y = np.array(rec["labels"], dtype=float)
+        split = {}
+        for when, setting in (("today", RCA2_TODAY), ("recommended", RCA2_SERVED)):
+            s, vs = _rca_replay(rec, setting, model)
+            n = {"same": 0, "related": 0, "unlabelled": 0, "none": 0}
+            for i, (it, v_item) in enumerate(zip(rec["items"], vs)):
+                if y[i] != 0.0 or math.isnan(s[i]) or s[i] > 30:
+                    continue
+                labs = [labels.get(a["pair_id"], "") for c, v in zip(it["calls"], v_item) for a in acting_against(c, v)]
+                n["none" if not labs else "same" if "same claim" in labs else "unlabelled" if "" in labs else "related"] += 1
+            assert sum(n.values()) == report["test_sets"][name][when]["fake_low"], (name, when, n)
+            split[when] = {"fake_low": sum(n.values()), "right_reason": n["same"], "by_luck": n["related"],
+                           "unlabelled": n["unlabelled"], "no_refuting_verdict_passage": n["none"]}
+        split["right_reason_kept_share"] = split["recommended"]["right_reason"] / max(1, split["today"]["right_reason"])
+        report["test_sets"][name]["right_reason_split"] = split
+        print(name, split, flush=True)
+    RCA2_REPORT.write_text(json.dumps(_json_safe(report), indent=2))
+    print("saved", RCA2_REPORT)
 
 
 def dump_pairs(out: str, name: str = "dev") -> None:
@@ -2611,6 +2709,9 @@ RCA2_STAGES = {
     "reword": lambda a: reword_lists(),         # the facts in three rewordings each, on the recorded evidence
     "sheet": lambda a: label_sheet(a.out),      # passages acting against today's Low dev fakes, for hand labels
     "label": lambda a: write_labels(a.labels),  # hand labels -> reports/root_cause_a_labels.csv
+    "sheet-sets": lambda a: label_sheet_sets(a.out),      # the same sheet for the test, matched and hoax sets
+    "label-sets": lambda a: write_labels_sets(a.labels),  # -> reports/root_cause_a_labels_test.csv
+    "test-split": lambda a: rca2_test_split(a),           # right-reason split on the test sets (no new scoring)
     "pairs": lambda a: dump_pairs(a.out),       # diagnostic sheet of the dev claim pairs (round-1 entailment values)
     "pairs-lists": lambda a: dump_pairs(a.out, "lists"),
     "entail-lists": lambda a: print(len(_verdict_pairs(_rca2_lists_rec(compute=True))), "verdict passages in the lists"),
