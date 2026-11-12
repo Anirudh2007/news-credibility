@@ -2,10 +2,14 @@
 #   powershell -ExecutionPolicy Bypass -File configs\azure\deploy.ps1
 # Sends: the code (no venvs, caches or databases), models/ (without the research-only Indian index and unused
 # experiment folders), data/reference/, and the .env with the API keys. Re-run it after code changes.
+# After a change to frontend/ only: add -FrontendOnly (sends the code, rebuilds and restarts only the UI; the API
+# keeps running and the models are not uploaded again):
+#   powershell -ExecutionPolicy Bypass -File configs\azure\deploy.ps1 -FrontendOnly
 param(
     [string]$Group = "newscred-rg",
     [string]$Vm = "newscred-vm",
-    [string]$Key = "$env:USERPROFILE\.ssh\newscred_azure"
+    [string]$Key = "$env:USERPROFILE\.ssh\newscred_azure",
+    [switch]$FrontendOnly
 )
 $ErrorActionPreference = "Stop"
 Set-Location (Resolve-Path "$PSScriptRoot\..\..")   # news-credibility/
@@ -19,7 +23,15 @@ Write-Host "1/4 Waiting for the VM's first-boot setup (Docker install)..."
 cmd /c "$ssh $target `"cloud-init status --wait > /dev/null; mkdir -p news-credibility; docker --version`""
 
 Write-Host "2/4 Code..."
-cmd /c "tar -cf - --exclude=./data --exclude=./models --exclude=./.venv --exclude=./venv --exclude=__pycache__ --exclude=.pytest_cache --exclude=.env --exclude=*.db . | $ssh $target `"tar -xf - -C news-credibility`""
+cmd /c "tar -cf - --exclude=./data --exclude=./models --exclude=./.git --exclude=./.venv --exclude=./venv --exclude=__pycache__ --exclude=.pytest_cache --exclude=.env --exclude=*.db . | $ssh $target `"tar -xf - -C news-credibility`""
+
+if ($FrontendOnly) {
+    Write-Host "Rebuilding and restarting the UI only..."
+    cmd /c "$ssh $target `"cd news-credibility && SITE_ADDRESS=$fqdn docker compose -f docker-compose.yml -f configs/azure/docker-compose.azure.yml up -d --build --no-deps frontend`""
+    Write-Host ""
+    Write-Host "UI updated: https://$fqdn (refresh the page; it can take about a minute)" -ForegroundColor Green
+    return
+}
 
 Write-Host "3/4 Models and reference data (about 2 GB; depends on your upload speed)..."
 cmd /c "tar -cf - --exclude=models/retrieval_index_india --exclude=models/meta_v4 --exclude=models/media_reuse_clf.joblib models data/reference | $ssh $target `"tar -xf - -C news-credibility`""
