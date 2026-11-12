@@ -105,6 +105,7 @@ def main() -> None:
         if (DEFAULT_CHECKWORTHY_DIR / "config.json").exists():
             scorers["deberta"] = DebertaCheckWorthiness()
         report = evaluate_checkworthiness(pd.read_parquet(OUT), scorers)
+        METRICS.parent.mkdir(parents=True, exist_ok=True)
         METRICS.write_text(json.dumps(report, indent=2))
         for name in scorers:
             r = report[name]["all"]

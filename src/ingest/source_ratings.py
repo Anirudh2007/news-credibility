@@ -176,6 +176,7 @@ def build(refresh: bool = False) -> pd.DataFrame:
     df = pd.concat([df, pd.DataFrame(extra, columns=df.columns)], ignore_index=True).sort_values("domain")
     OUT.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(OUT, index=False)
+    SUMMARY.parent.mkdir(parents=True, exist_ok=True)
     SUMMARY.write_text(json.dumps({
         "built": date.today().isoformat(), "domains": int(len(df)),
         "by_basis": df["basis"].value_counts().to_dict(), "by_bias": df["bias"].value_counts().to_dict(),

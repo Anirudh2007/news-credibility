@@ -872,6 +872,7 @@ def main() -> None:
 
         searcher = HybridSearcher.load(ROOT / "models" / "retrieval_index")
         report = evaluate_verifier(df, ClaimVerifier(), searcher=searcher, reranker=cross_encoder_reranker())
+        (ROOT / "reports").mkdir(parents=True, exist_ok=True)
         (ROOT / "reports" / "verifier_metrics.json").write_text(json.dumps(report, indent=2))
         for setting in ("gold_concat", "gold_passages", "retrieved", "retrieved_gated"):
             if setting in report:

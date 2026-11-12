@@ -361,6 +361,7 @@ def build_hoaxes(seed: int = SEED + 2) -> pd.DataFrame:
 def main() -> None:
     import sys
 
+    SUMMARY.parent.mkdir(parents=True, exist_ok=True)  # all four summaries go to reports/, not in git
     if "--hoax" in sys.argv:
         build_hoaxes()
         print(json.dumps(json.loads(HOAX_SUMMARY.read_text()), indent=1))

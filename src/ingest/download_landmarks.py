@@ -198,6 +198,7 @@ def calibrate(max_false_mismatch: float = 0.05) -> dict:
                 "well, so a real mismatch rate on news photos would be higher than wrong_place_flagged suggests "
                 "and false alarms more frequent than true_photos_wrongly_flagged.",
     }
+    REPORT.parent.mkdir(parents=True, exist_ok=True)
     REPORT.write_text(json.dumps(out, indent=2))
     return out
 

@@ -392,6 +392,7 @@ def main() -> None:
     if args.eval:
         report = evaluate_retrieval(df, reranker=cross_encoder_reranker())
         out = root / "reports" / "retrieval_metrics.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(report, indent=2))
         print(json.dumps(report, indent=2))
         return

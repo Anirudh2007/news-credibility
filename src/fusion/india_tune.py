@@ -2754,6 +2754,7 @@ def main() -> None:
             p.add_argument("--twice", action="store_true",
                            help="news: search a covered claim again with its keywords if the first search heard nothing")
     args = ap.parse_args()
+    (ROOT / "reports").mkdir(parents=True, exist_ok=True)  # results folder, not in git
     suffix = suffix_of(args.sources)
     if args.cmd == "record":
         print("saved", record(args.set, args.sources))

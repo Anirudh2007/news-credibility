@@ -239,6 +239,7 @@ def main() -> None:
         results = [by_id[c.id] for c in CASES if c.id in by_id]
     report = {"run_at": now, "api": args.api, "model_version": health.get("model_version"),
               "components": health.get("components"), "cases": results}
+    args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     print("saved", args.out)
 

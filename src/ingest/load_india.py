@@ -144,6 +144,7 @@ def build(raw_dir: Path = RAW_DIR, out_dir: Path = OUT_DIR) -> dict:
         "multiclaim_en": {"rows": len(mc), "by_split": mc["split"].value_counts().to_dict(),
                           "credible": mc["credible"].value_counts().to_dict()},
     }
+    SUMMARY.parent.mkdir(parents=True, exist_ok=True)
     SUMMARY.write_text(json.dumps(summary, indent=2))
     return summary
 

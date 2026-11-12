@@ -335,6 +335,7 @@ def main() -> None:
         "test_macro_f1": float(f1_score(y[test], model.predict(X[test]), average="macro")) if test.any() else None,
         "feature_importance": dict(zip(FEATURE_NAMES, map(int, model.feature_importances_))),
     }
+    (ROOT / "reports").mkdir(parents=True, exist_ok=True)
     (ROOT / "reports" / "source_metrics.json").write_text(json.dumps(report, indent=2))
     print(json.dumps(report, indent=2))
 

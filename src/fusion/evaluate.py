@@ -989,6 +989,7 @@ def main() -> None:
     sub.add_parser("source-compare", help="source check: FakeNewsNet classifier vs outlet ratings -> source_comparison.json")
     args = ap.parse_args()
 
+    REPORTS.mkdir(parents=True, exist_ok=True)  # results folder, not in git
     if args.cmd == "source-compare":
         report = source_comparison()
         (REPORTS / "source_comparison.json").write_text(json.dumps(report, indent=2, default=float))

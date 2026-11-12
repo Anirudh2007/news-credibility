@@ -550,6 +550,7 @@ def main() -> None:
     else:  # macro-F1 is undefined with one class; say so instead of omitting silently
         report["test_macro_f1"] = None
         report["test_note"] = "test split has fewer than 2 classes (event split); macro-F1 undefined"
+    (ROOT / "reports").mkdir(parents=True, exist_ok=True)
     (ROOT / "reports" / "media_reuse_metrics.json").write_text(json.dumps(report, indent=2))
     print(json.dumps(report, indent=2))
 

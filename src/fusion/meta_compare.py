@@ -103,6 +103,7 @@ def main() -> None:
               "benchmark": benchmark(models)}
     report["india"] = india(models, ("dev", "test", "matched") if args.test else ("dev",))
     report["decision"] = decide(report["benchmark"], report["india"])
+    OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(report, indent=2, default=float))
     print(json.dumps(report["decision"], indent=1))
     print("saved", OUT)

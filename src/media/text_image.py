@@ -290,6 +290,7 @@ def main() -> None:
     X_te, y_te = data["test"]
     report["test"] = classification_report(y_te, clf.predict(X_te), target_names=CLASSES, output_dict=True, zero_division=0)
     out = ROOT / "reports" / "text_image_metrics.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2))
     print(json.dumps({"best_C": report["best_C"], "test_macro_f1": report["test"]["macro avg"]["f1-score"]}, indent=2))
 
