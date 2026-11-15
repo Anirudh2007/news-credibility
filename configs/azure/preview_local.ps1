@@ -1,5 +1,5 @@
-# Runs the Azure stack on this PC: the same compose files, the same Caddy reverse proxy and the same settings as
-# the VM (template explanations, restart policies, the UI reached only through the proxy), so the browser shows
+# Runs the Azure stack on this PC: the same compose files, the same web app container and the same settings as
+# the VM (template explanations, restart policies, the API reached only through the web app), so the browser shows
 # what the hosted site will look like. Run from anywhere:
 #   powershell -ExecutionPolicy Bypass -File configs\azure\preview_local.ps1          # http://localhost
 #   powershell -ExecutionPolicy Bypass -File configs\azure\preview_local.ps1 -Https   # https://localhost
@@ -18,8 +18,8 @@ if ($Stop) { docker compose @files down; return }   # volumes (history, caches) 
 docker info *> $null
 if ($LASTEXITCODE -ne 0) { throw "Docker is not running: start Docker Desktop and try again." }
 
-Write-Host "Building the image and starting API, UI and Caddy (compose waits until the models are loaded)..."
-docker compose @files up -d --build
+Write-Host "Building the images and starting the API and the web app (compose waits until the models are loaded)..."
+docker compose @files up -d --build --remove-orphans
 if ($LASTEXITCODE -ne 0) { throw "docker compose failed (see the messages above)." }
 
 Write-Host "Waiting for $url ..."
@@ -28,7 +28,7 @@ do {
     Start-Sleep -Seconds 3
     $code = curl.exe -s -k -o NUL -w "%{http_code}" $url
 } until ($code -eq "200" -or (Get-Date) -gt $deadline)
-if ($code -ne "200") { throw "No answer from $url (last status: $code). Check: docker compose $($files -join ' ') logs caddy" }
+if ($code -ne "200") { throw "No answer from $url (last status: $code). Check: docker compose $($files -join ' ') logs frontend" }
 
 Write-Host ""
 Write-Host "Preview running at $url (same stack as the Azure VM). Stop it with -Stop." -ForegroundColor Green

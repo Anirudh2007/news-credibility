@@ -69,7 +69,7 @@ def architecture(path: Path = FIG / "architecture.png") -> Path:
 
     box(0.2, 0.4, 3.6, 1.1, "Score + band\nLow · Questionable ·\nMostly credible · High · Unverified", fc="#c6f6d5")
     box(4.3, 0.4, 4.0, 1.1, "Explanation\nSHAP points per check (sum = score)\nquoted evidence · fact-check badge\ntemplate / validated LLM text", fc="#c6f6d5")
-    box(8.8, 0.4, 4.0, 1.1, "FastAPI + SQLite (history, feedback, cache)\n→ Streamlit UI", fc="#e9d8fd")
+    box(8.8, 0.4, 4.0, 1.1, "FastAPI + SQLite (history, feedback, cache)\n→ React web app", fc="#e9d8fd")
     arrow(5.0, 2.2, 2.0, 1.5)
     arrow(8.0, 2.2, 6.3, 1.5)
     arrow(11.0, 2.2, 10.8, 1.5)

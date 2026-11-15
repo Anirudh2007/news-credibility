@@ -1,4 +1,5 @@
-# Starts the API and the Streamlit frontend from one image (Phase 8).
+# Starts the API and the web app (Phase 8). The web app container (Caddy) serves the built React app and
+# forwards the API routes it uses; the browser only ever talks to it.
 #
 #   docker compose up --build      API docs http://localhost:8000/docs, UI http://localhost:8501
 #   docker compose run --rm api python -m pytest -q      test suite inside the image
@@ -39,14 +40,10 @@ services:
       start_period: 600s  # first start downloads ~1 GB of base models before /health answers
 
   frontend:
-    build: .  # same image (cached build); only the command differs
-    image: news-credibility:latest
-    working_dir: /app/frontend  # Streamlit reads its theme from .streamlit/ in the working directory
-    command: python -m streamlit run app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
+    build: ./frontend  # Node builds the app, Caddy serves it (frontend/Dockerfile, frontend/Caddyfile)
+    image: news-credibility-web:latest
     ports:
       - "8501:8501"
-    environment:
-      NEWSCRED_API: http://api:8000
     depends_on:
       api:
         condition: service_healthy

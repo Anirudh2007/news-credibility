@@ -61,8 +61,6 @@ httpx  # FastAPI TestClient
 # Phase 5: LLM explanations via OpenAI-compatible router (freellmapi)
 openai
 
-# Phase 6/7: history + feedback database, Streamlit frontend
+# Phase 6: history + feedback database (the web app in frontend/ has its own package.json)
 sqlalchemy
-streamlit
-plotly
 requests

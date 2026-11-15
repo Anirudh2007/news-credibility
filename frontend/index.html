@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>News Credibility: check a story before you share it</title>
+    <meta
+      name="description"
+      content="Paste a news link, a claim or an image. We find the factual claims, check them against published fact-checks and trusted reporting, and show you the evidence."
+    />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#F6F3EC" />
+    <script>
+      // A reader who chose Light or Dark gets it before the first paint, so the page never flashes the
+      // other theme. With no choice stored, the stylesheet follows the system. (Same key as src/lib/theme.ts.)
+      try {
+        var theme = localStorage.getItem('newscred.theme')
+        if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme
+      } catch (e) {}
+    </script>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,295 @@
+@import "tailwindcss";
+@import "@fontsource-variable/newsreader/opsz.css";
+@import "@fontsource-variable/public-sans/index.css";
+
+/* ==========================================================================================
+   Design tokens. Every colour, typeface, duration and easing curve in the app comes from here.
+
+   COLOUR  Blue and rust are a colour-blind-safe pair: blue means "holds up", rust means "does not".
+           Colour is never the only cue; every status also has an icon and a word.
+           contrast.test.ts fails the build if a text colour drops below 4.5:1.
+
+   MOTION  One system: CSS transitions for anything that can be toggled, keyframes only for the
+           one-shot verdict reveal. Movement uses transform and opacity; the single exception is the
+           expander, which opens with the grid-rows technique so its height never has to be measured.
+
+           --dur-press      press, hover and colour feedback
+           --dur-pop        small things appearing (the image chip, the theme menu)
+           --dur-pop-out    the theme menu closing
+           --dur-expand     "Add details", claim sources, technical details
+           --dur-panel      the Recent checks drawer and its scrim, coming in
+           --dur-panel-out  the same, leaving (about 30% shorter: attention has already moved on)
+           --dur-reveal     each piece of the verdict as it arrives
+           --dur-leave      the desk and skeleton making way for the verdict
+
+           --ease-out       entrances: fastest at the start, so the response feels immediate
+           --ease-in        exits: gets out of the way at the end
+           --ease-in-out    things that resize while staying on screen
+
+           The order and delays of the verdict reveal live in src/lib/timing.ts (TIMING).
+   ========================================================================================== */
+
+:root {
+  --paper: #F6F3EC;
+  --surface: #FFFFFF;
+  --ink: #16202E;
+  --text: #1D2633;
+  --muted: #5B6270;
+  --line: #E3DCCD;
+  --accent: #1F5FA6;
+  --on-accent: #FFFFFF;
+  --rust: #B23E0A;
+  --amber: #B97F06;
+  --sky: #5B8FC9;
+  --grey: #6B7280;
+
+  --dur-press: 120ms;
+  --dur-pop: 200ms;
+  --dur-pop-out: 150ms;
+  --dur-expand: 240ms;
+  --dur-panel: 280ms;
+  --dur-panel-out: 200ms;
+  --dur-reveal: 320ms;
+  --dur-leave: 150ms;
+  --ease-out: cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-in: cubic-bezier(0.55, 0, 1, 0.45);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+
+  color-scheme: light;
+}
+
+/* THEME  The reader chooses System (the default), Light or Dark from the header (src/lib/theme.ts,
+          which puts data-theme on <html>). Light is the base above. The dark colours are written twice
+          because CSS cannot share one block between a media query and an attribute: once for a system in
+          dark mode, unless the reader chose Light, and once for a reader who chose Dark.
+          contrast.test.ts fails if the two copies ever differ. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #111823;
+    --surface: #172131;
+    --ink: #ECE8DF;
+    --text: #ECE8DF;
+    --muted: #A3ADBB;
+    --line: #2A3545;
+    --accent: #8FB8E8;
+    --on-accent: #0B1119;
+    --rust: #F08A4B;
+    --amber: #E9B44C;
+    --sky: #8FB8E8;
+    --grey: #8E99A8;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #111823;
+  --surface: #172131;
+  --ink: #ECE8DF;
+  --text: #ECE8DF;
+  --muted: #A3ADBB;
+  --line: #2A3545;
+  --accent: #8FB8E8;
+  --on-accent: #0B1119;
+  --rust: #F08A4B;
+  --amber: #E9B44C;
+  --sky: #8FB8E8;
+  --grey: #8E99A8;
+  color-scheme: dark;
+}
+
+/* Changing theme swaps every colour on the same frame; nothing fades across the page. */
+.theme-switching,
+.theme-switching *,
+.theme-switching *::before,
+.theme-switching *::after {
+  transition: none !important;
+}
+
+
+@theme inline {
+  --color-paper: var(--paper);
+  --color-surface: var(--surface);
+  --color-ink: var(--ink);
+  --color-body: var(--text);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --color-accent: var(--accent);
+  --color-on-accent: var(--on-accent);
+  --color-rust: var(--rust);
+  --color-amber: var(--amber);
+  --color-sky: var(--sky);
+  --color-grey: var(--grey);
+  --color-tone: var(--tone);
+
+  --font-display: "Newsreader Variable", Georgia, "Times New Roman", serif;
+  --font-body: "Public Sans Variable", system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* ---- Base ------------------------------------------------------------------------------- */
+
+html {
+  background: var(--paper);
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100dvh;
+  background: var(--paper);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  overflow-wrap: break-word;
+}
+
+/* The focus ring appears with no transition: keyboard users move faster than any animation. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--accent) 24%, transparent);
+}
+
+/* ---- Status tones: one variable, used for the icon, the dot and the border ---------------- */
+
+.tone-good { --tone: var(--accent); }
+.tone-ok { --tone: var(--sky); }
+.tone-warn { --tone: var(--amber); }
+.tone-bad { --tone: var(--rust); }
+.tone-neutral { --tone: var(--grey); }
+
+/* ---- Press and hover ------------------------------------------------------------------------ */
+
+.press {
+  transition: transform var(--dur-press) var(--ease-out);
+}
+.press:active:not(:disabled) {
+  transform: scale(0.96);
+}
+
+/* A button wider than about 200px does not shrink when pressed (4% of a wide surface is a visible jump):
+   it darkens instead. Used for Verify, which is full width on a phone. */
+@media (max-width: 639px) {
+  .press-darken:active:not(:disabled) {
+    transform: none;
+    filter: brightness(0.9);
+  }
+}
+
+/* Hover styles only where a real pointer hovers; a tap on a touch screen must not trigger them. */
+.hover-fade {
+  transition: background-color var(--dur-press) ease, color var(--dur-press) ease,
+    border-color var(--dur-press) ease;
+}
+
+/* ---- Expander: content height animates through grid rows, never through `height` ------------- */
+
+.expander {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows var(--dur-expand) var(--ease-in-out);
+}
+.expander[data-open="true"] {
+  grid-template-rows: 1fr;
+}
+.expander > .expander-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ---- Recent checks drawer: comes from the right edge, leaves the way it came ----------------- */
+
+.drawer {
+  transform: translateX(100%);
+  transition: transform var(--dur-panel-out) var(--ease-in);
+  will-change: transform;
+}
+.drawer[data-open="true"] {
+  transform: translateX(0);
+  transition: transform var(--dur-panel) var(--ease-out);
+}
+.scrim {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--dur-panel-out) var(--ease-in);
+}
+.scrim[data-open="true"] {
+  opacity: 1;
+  pointer-events: auto;
+  transition: opacity var(--dur-panel) var(--ease-out);
+}
+
+/* ---- Theme menu: grows out of the button that opened it (its top-right corner), never from its centre.
+        Stays mounted and inert while shut, so it can fade out instead of vanishing. ------------- */
+
+.popover {
+  opacity: 0;
+  transform: scale(0.97);
+  transform-origin: top right;
+  pointer-events: none;
+  transition: opacity var(--dur-pop-out) var(--ease-in), transform var(--dur-pop-out) var(--ease-in);
+}
+.popover[data-open="true"] {
+  opacity: 1;
+  transform: scale(1);
+  pointer-events: auto;
+  transition: opacity var(--dur-pop) var(--ease-out), transform var(--dur-pop) var(--ease-out);
+}
+
+/* ---- The desk making way for the verdict ------------------------------------------------------ */
+
+.leaving {
+  opacity: 0;
+  transition: opacity var(--dur-leave) var(--ease-in);
+}
+
+/* ---- One-shot entrances ------------------------------------------------------------------------ */
+
+@keyframes reveal {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+/* Only a result the reader just asked for plays the reveal; one opened from a link is already at rest. */
+[data-reveal="on"] .reveal {
+  animation: reveal var(--dur-reveal) var(--ease-out) both;
+  animation-delay: var(--reveal-delay, 0ms);
+}
+
+@keyframes pop {
+  from { opacity: 0; transform: scale(0.97); }
+  to { opacity: 1; transform: scale(1); }
+}
+.pop {
+  animation: pop var(--dur-pop) var(--ease-out) both;
+}
+
+/* Linear because the motion is time itself: the check is still running. */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+.spinner {
+  animation: spin 800ms linear infinite;
+}
+
+/* ---- Reduced motion: every animation off, the same end states; the busy indicator keeps turning
+        because a frozen spinner looks like a hang ------------------------------------------------ */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+  }
+  .spinner {
+    animation-duration: 800ms !important;
+    animation-iteration-count: infinite !important;
+  }
+}

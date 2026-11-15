@@ -1,0 +1,44 @@
+# Serves the built web app and forwards to FastAPI only the routes the app calls. Everything else on the API
+# (the history list, the feedback summary, the source lookup, /docs) is not reachable from outside.
+#
+# SITE_ADDRESS: ":8501" by default (plain HTTP, local use). On the Azure VM it is the VM's DNS name, and Caddy
+# then gets a Let's Encrypt certificate for it and serves HTTPS.
+{$SITE_ADDRESS::8501} {
+	encode gzip
+
+	# Run a check, send feedback
+	@submit {
+		method POST
+		path /api/v1/analyze /api/v1/feedback
+	}
+	# Open or delete one check by its id
+	@check {
+		method GET DELETE
+		path_regexp ^/api/v1/analyses/[A-Za-z0-9_-]+$
+	}
+	@health {
+		method GET
+		path /health
+	}
+
+	handle @submit {
+		reverse_proxy api:8000
+	}
+	handle @check {
+		reverse_proxy api:8000
+	}
+	handle @health {
+		reverse_proxy api:8000
+	}
+	handle /api/* {
+		respond "Not found" 404
+	}
+
+	# The app itself. Unknown paths get index.html, so /check/<id> and /how-it-works work on reload.
+	handle {
+		root * /srv
+		header /assets/* Cache-Control "public, max-age=31536000, immutable"
+		try_files {path} /index.html
+		file_server
+	}
+}

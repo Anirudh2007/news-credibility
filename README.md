@@ -5,7 +5,7 @@ published fact-checks), and returns a 0–100 credibility score with plain-langu
 The score comes only from checks that look at evidence (claims, image, source, dates): how a text is worded is never
 scored. English only; video and Indian languages are future work.
 
-Status: phases 0–7 built (channels, meta-learner, explanations, API, Streamlit UI). Phase 8: evaluation, Docker and
+Status: phases 0–7 built (channels, meta-learner, explanations, API, React web app). Phase 8: evaluation, Docker and
 India test sets done; deployment and the final report remain.
 
 | Phase | Stage | Code |
@@ -22,7 +22,7 @@ India test sets done; deployment and the final report remain.
 | 4 | Meta-learner (LightGBM + isotonic calibration) | `src/fusion/` |
 | 5 | Explanations (SHAP points, templates, optional LLM wording) | `src/explain/` |
 | 6 | FastAPI backend, SQLite history and feedback | `api/` |
-| 7 | Streamlit frontend | `frontend/` |
+| 7 | Web app (React, Vite, Tailwind) | `frontend/` |
 | 8 | Evaluation, robustness, Docker | `src/fusion/evaluate.py`, `Dockerfile` |
 
 ## Setup
@@ -48,7 +48,7 @@ models/           meta_lgbm.txt, meta_calibrator.joblib, source_clf.joblib, text
 data/reference/   sources.csv (outlet ratings), landmarks/ (reference photos for the location check)
 ```
 
-A missing model is skipped, not fatal: the sidebar's "Model status" lists what loaded. To build everything from
+A missing model is skipped, not fatal: `http://localhost:8000/health` lists what loaded. To build everything from
 scratch instead, create the folders and follow the rebuild order below:
 
 ```bash
@@ -116,11 +116,17 @@ The two lists always contain the old shared top 5, so the rule only adds passage
 
 ```bash
 python -m uvicorn api.main:app              # terminal 1, API docs at http://localhost:8000/docs
-cd frontend                                 # terminal 2: run from here so the theme (frontend/.streamlit/) loads
-python -m streamlit run app.py              # http://localhost:8501
+cd frontend                                 # terminal 2 (Node 22 or newer)
+npm install                                 # first time only
+npm run dev                                 # http://localhost:5173, forwards /api to the API
 ```
 
 The first analysis loads every model, so it is slow; later ones take seconds.
+
+The web app shows a verdict in words, a two-sentence bottom line, three reasoning cards and the claims with
+their sources. `frontend/src/translate/` turns an API report into that wording; the score, the points per check
+and the other model numbers appear only under "View technical verification details". `npm test` runs the
+frontend tests, `npm run build` type-checks and builds `frontend/dist/`.
 
 ## Rebuild order (after changing data or a channel model)
 
@@ -186,11 +192,12 @@ Input that is not readable English (keyboard mashing, symbols, other languages) 
 
 ## Docker
 
-One image, two services; `models/` and `data/reference/` are mounted from the host, so fill them first (rebuild order).
+Two images: the API, and the web app (the built React files served by Caddy, which also forwards the API routes
+the app uses). `models/` and `data/reference/` are mounted from the host, so fill them first (rebuild order).
 Needs Docker Desktop (Windows: WSL 2 backend) running. API keys are read from `.env` at start, never copied into the image.
 
 ```bash
-docker compose up --build                       # API http://localhost:8000/docs, UI http://localhost:8501
+docker compose up --build                       # API http://localhost:8000/docs, web app http://localhost:8501
 docker compose run --rm api python -m pytest -q # test suite inside the image
 ```
 
@@ -207,14 +214,15 @@ docker compose up -d                              # wait until `docker compose p
 cloudflared tunnel --url http://localhost:8501    # prints https://<random-words>.trycloudflare.com
 ```
 
-The address changes on every run and has no uptime guarantee. Anyone with it can use the app, including the History
-page.
+The address changes on every run and has no uptime guarantee. Anyone with it can use the app. Through the web app
+only four API routes are reachable (run a check, open or delete one check by its id, send feedback, health); the
+history list and `/docs` are not.
 
 ### Host on an Azure VM (fixed https address)
 
 `configs/azure/`: `create_vm.ps1` makes an Ubuntu VM (Standard_B2as_v2, 2 vCPU, 8 GiB; Docker installed on first
 boot; SSH only from your address), `deploy.ps1` copies the code, `models/`, `data/reference/` and `.env` and starts
-the same compose stack plus Caddy for HTTPS (`docker-compose.azure.yml`). Needs the Azure CLI (`az login`) and an SSH
+the same compose stack with HTTPS on the web app container (`docker-compose.azure.yml`). Needs the Azure CLI (`az login`) and an SSH
 key at `~/.ssh/newscred_azure`.
 
 ```powershell
@@ -233,7 +241,7 @@ too small for the models).
 | `src/` | pipeline code, one folder per stage |
 | `models/` | saved checkpoints (not in git) |
 | `api/` | FastAPI backend |
-| `frontend/` | Streamlit demo |
+| `frontend/` | web app: React + Vite + Tailwind (`src/`), its tests, its Dockerfile and Caddyfile |
 | `tests/` | pytest tests |
 | `configs/azure/` | Azure VM scripts: create the VM, deploy, HTTPS (settings are environment variables, `.env.example`) |
 | `reports/` | output of the evaluation scripts: JSON results and figures (not in git) |

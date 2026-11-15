@@ -1,5 +1,5 @@
-# One image for the API and the Streamlit frontend (Phase 8);
-# docker-compose.yml starts each with its own command.
+# The API image (Phase 8). The web app has its own small image: frontend/Dockerfile.
+# docker-compose.yml starts both.
 #
 # Not baked in: models/ and data/reference/ (git-ignored, several GB). They are
 # mounted at run time, so retraining needs no rebuild. Hugging Face base models
@@ -39,12 +39,11 @@ RUN TORCH=$(grep -i "^torch==" requirements_locked.txt | cut -d= -f3) \
 
 COPY src ./src
 COPY api ./api
-COPY frontend ./frontend
 COPY tests ./tests
 
 # Unprivileged user; the database and model-cache volumes must be writable by it.
 RUN useradd --create-home app && mkdir -p /db /cache/huggingface && chown app /db /cache/huggingface
 USER app
 
-EXPOSE 8000 8501
+EXPOSE 8000
 CMD ["python", "-m", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
